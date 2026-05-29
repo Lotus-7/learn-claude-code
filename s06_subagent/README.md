@@ -1,6 +1,5 @@
 # s06: Subagent — 大任务拆小，每个拿到的都是干净上下文
 
-[中文](README.md) · [English](README.en.md) · [日本語](README.ja.md)
 
 s01 → s02 → s03 → s04 → s05 → `s06` → [s07](../s07_skill_loading/) → s08 → ... → s20
 

@@ -1,26 +1,27 @@
 #!/usr/bin/env python3
 """
-s17: Autonomous Agents — idle poll + auto-claim + WORK/IDLE lifecycle.
+s17: 自主智能体 —— 空闲轮询 + 自动认领 + 工作/空闲生命周期。
 
-Run:  python s17_autonomous_agents/code.py
-Need: pip install anthropic python-dotenv + .env with ANTHROPIC_API_KEY
+运行:  python s17_autonomous_agents/code.py
+依赖: pip install anthropic python-dotenv + .env 配置 ANTHROPIC_API_KEY
 
-Changes from s16:
-  - scan_unclaimed_tasks: find pending, unowned tasks with deps completed
-  - idle_poll: 60s polling loop (inbox + task board), dispatches shutdown in IDLE
-  - claim_task: owner check + return value verification
-  - Teammate lifecycle: WORK → IDLE → SHUTDOWN
-  - Teammate tools: + list_tasks, claim_task, complete_task (5→8)
-  - consume_lead_inbox: unified inbox consumer for protocol + context injection
-  - Identity re-injection after context compression
+s16 到 s17 的蜕变:
+  - scan_unclaimed_tasks: 寻找那些依赖已完成、却仍旧无人问津的任务
+  - idle_poll: 60秒的空闲轮询 (检查邮箱 + 任务板)，在 IDLE 状态下分发关机指令
+  - claim_task: 增加了所有者校验和返回值验证
+  - 队友生命周期: WORK (工作) → IDLE (空闲) → SHUTDOWN (停机)
+  - 队友工具扩充: + list_tasks, claim_task, complete_task (5 变 8)
+  - consume_lead_inbox: 统一的邮箱消费者，处理协议与上下文注入
+  - 身份重新注入: 在上下文被压缩后，温柔地唤醒它的自我认知
 
-ASCII lifecycle:
-  WORK: inbox → LLM → tools → (tool_use? loop) → (done? → IDLE)
-  IDLE: 5s poll → inbox? → WORK / unclaimed? → claim → WORK / 60s? → SHUTDOWN
+ASCII 生命周期:
+  WORK: 邮箱 → LLM → 工具 → (调用工具? 循环) → (做完了? → IDLE)
+  IDLE: 5秒轮询 → 邮箱有信? → WORK / 有未领任务? → 认领 → WORK / 过了60秒? → SHUTDOWN
 """
 
 import os, subprocess, json, time, random, threading
 from pathlib import Path
+from typing import Optional
 from datetime import datetime
 from dataclasses import dataclass, asdict, field
 
@@ -39,9 +40,9 @@ if os.getenv("ANTHROPIC_BASE_URL"):
 
 WORKDIR = Path.cwd()
 client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
-MODEL = os.environ["MODEL_ID"]
+MODEL = os.getenv("MODEL_ID", "deepseek-v4-pro")
 
-# ── Task System (from s12) ──
+# ── 任务系统（继承自 s12） ──
 
 TASKS_DIR = WORKDIR / ".tasks"
 TASKS_DIR.mkdir(exist_ok=True)
@@ -53,7 +54,7 @@ class Task:
     subject: str
     description: str
     status: str
-    owner: str | None
+    owner: Optional[str]
     blockedBy: list[str]
 
 
@@ -104,49 +105,49 @@ def can_start(task_id: str) -> bool:
 def claim_task(task_id: str, owner: str = "agent") -> str:
     task = load_task(task_id)
     if task.status != "pending":
-        return f"Task {task_id} is {task.status}, cannot claim"
+        return f"任务 {task_id} 的状态是 {task.status}，无法认领"
     if task.owner:
-        return f"Task {task_id} already owned by {task.owner}"
+        return f"任务 {task_id} 已名花有主 ({task.owner})"
     if not can_start(task_id):
         deps = [d for d in task.blockedBy
                 if _task_path(d).exists() and load_task(d).status != "completed"]
         missing = [d for d in task.blockedBy if not _task_path(d).exists()]
         parts = []
-        if deps: parts.append(f"blocked by: {deps}")
-        if missing: parts.append(f"missing deps: {missing}")
-        return "Cannot start — " + ", ".join(parts)
+        if deps: parts.append(f"被以下阻塞: {deps}")
+        if missing: parts.append(f"缺失的依赖: {missing}")
+        return "无法开始 — " + ", ".join(parts)
     task.owner = owner
     task.status = "in_progress"
     save_task(task)
-    print(f"  \033[36m[claim] {task.subject} → in_progress\033[0m")
-    return f"Claimed {task.id} ({task.subject})"
+    print(f"  \033[36m[认领] {task.subject} → in_progress\033[0m")
+    return f"已认领 {task.id} ({task.subject})"
 
 
 def complete_task(task_id: str) -> str:
     task = load_task(task_id)
     if task.status != "in_progress":
-        return f"Task {task_id} is {task.status}, cannot complete"
+        return f"任务 {task_id} 的状态是 {task.status}，无法标记完成"
     task.status = "completed"
     save_task(task)
     unblocked = [t.subject for t in list_tasks()
                  if t.status == "pending" and t.blockedBy and can_start(t.id)]
-    print(f"  \033[32m[complete] {task.subject} ✓\033[0m")
-    msg = f"Completed {task.id} ({task.subject})"
+    print(f"  \033[32m[完成] {task.subject} ✓\033[0m")
+    msg = f"已完成 {task.id} ({task.subject})"
     if unblocked:
-        msg += f"\nUnblocked: {', '.join(unblocked)}"
+        msg += f"\n解锁新任务: {', '.join(unblocked)}"
     return msg
 
 
-# ── Prompt Assembly (from s10) ──
+# ── 提示词组装（继承自 s10） ──
 
 PROMPT_SECTIONS = {
-    "identity": "You are a coding agent. Act, don't explain.",
-    "tools": "Available tools: bash, read_file, write_file, "
+    "identity": "你是一个编码智能体。少解释，多做事。",
+    "tools": "可用工具: bash, read_file, write_file, "
              "create_task, list_tasks, get_task, claim_task, complete_task, "
              "spawn_teammate, send_message, check_inbox, "
              "request_shutdown, request_plan, review_plan.",
-    "workspace": f"Working directory: {WORKDIR}",
-    "memory": "Relevant memories are injected below when available.",
+    "workspace": f"工作目录: {WORKDIR}",
+    "memory": "相关的记忆会在可用时注入到下方，它们是你灵魂的锚点。",
 }
 
 
@@ -155,7 +156,7 @@ def assemble_system_prompt(context: dict) -> str:
                 PROMPT_SECTIONS["tools"],
                 PROMPT_SECTIONS["workspace"]]
     if context.get("memories"):
-        sections.append(f"Relevant memories:\n{context['memories']}")
+        sections.append(f"相关记忆:\n{context['memories']}")
     return "\n\n".join(sections)
 
 
@@ -171,12 +172,12 @@ def get_system_prompt(context: dict) -> str:
     return _last_prompt
 
 
-# ── Tools (from s15) ──
+# ── 工具箱（继承自 s15） ──
 
 def safe_path(p: str) -> Path:
     path = (WORKDIR / p).resolve()
     if not path.is_relative_to(WORKDIR):
-        raise ValueError(f"Path escapes workspace: {p}")
+        raise ValueError(f"路径试图逃离工作区: {p}")
     return path
 
 
@@ -185,19 +186,19 @@ def run_bash(command: str) -> str:
         r = subprocess.run(command, shell=True, cwd=WORKDIR,
                            capture_output=True, text=True, timeout=120)
         out = (r.stdout + r.stderr).strip()
-        return out[:50000] if out else "(no output)"
+        return out[:50000] if out else "(无输出)"
     except subprocess.TimeoutExpired:
-        return "Error: Timeout (120s)"
+        return "错误: 执行超时 (120s)"
 
 
-def run_read(path: str, limit: int | None = None) -> str:
+def run_read(path: str, limit: Optional[int] = None) -> str:
     try:
         lines = safe_path(path).read_text().splitlines()
         if limit and limit < len(lines):
-            lines = lines[:limit] + [f"... ({len(lines) - limit} more lines)"]
+            lines = lines[:limit] + [f"... (还有 {len(lines) - limit} 行)"]
         return "\n".join(lines)
     except Exception as e:
-        return f"Error: {e}"
+        return f"读取错误: {e}"
 
 
 def run_write(path: str, content: str) -> str:
@@ -205,12 +206,12 @@ def run_write(path: str, content: str) -> str:
         fp = safe_path(path)
         fp.parent.mkdir(parents=True, exist_ok=True)
         fp.write_text(content)
-        return f"Wrote {len(content)} bytes to {path}"
+        return f"成功写入 {len(content)} 字节到 {path}"
     except Exception as e:
-        return f"Error: {e}"
+        return f"写入错误: {e}"
 
 
-# ── MessageBus (from s15) ──
+# ── 消息总线（继承自 s15） ──
 
 MAILBOX_DIR = WORKDIR / ".mailboxes"
 MAILBOX_DIR.mkdir(exist_ok=True)
@@ -225,7 +226,7 @@ class MessageBus:
         inbox = MAILBOX_DIR / f"{to_agent}.jsonl"
         with open(inbox, "a") as f:
             f.write(json.dumps(msg) + "\n")
-        print(f"  \033[33m[bus] {from_agent} → {to_agent}: "
+        print(f"  \033[33m[总线] {from_agent} → {to_agent}: "
               f"({msg_type}) {content[:50]}\033[0m")
 
     def read_inbox(self, agent: str) -> list[dict]:
@@ -242,7 +243,7 @@ BUS = MessageBus()
 active_teammates: dict[str, bool] = {}
 
 
-# ── Protocol State (from s16) ──
+# ── 协议状态机（继承自 s16） ──
 
 @dataclass
 class ProtocolState:
@@ -263,34 +264,34 @@ def new_request_id() -> str:
 
 
 def match_response(response_type: str, request_id: str, approve: bool):
-    """Correlate a response to the original request via request_id."""
+    """通过 request_id 将回应与原始请求匹配。"""
     state = pending_requests.get(request_id)
     if not state:
-        print(f"  \033[31m[protocol] unknown request_id: {request_id}\033[0m")
+        print(f"  \033[31m[协议] 未知的 request_id: {request_id}\033[0m")
         return
     if state.type == "shutdown" and response_type != "shutdown_response":
-        print(f"  \033[31m[protocol] type mismatch: expected shutdown_response, "
-              f"got {response_type}\033[0m")
+        print(f"  \033[31m[协议] 类型不匹配: 期待 shutdown_response, "
+              f"却收到了 {response_type}\033[0m")
         return
     if state.type == "plan_approval" and response_type != "plan_approval_response":
-        print(f"  \033[31m[protocol] type mismatch: expected plan_approval_response, "
-              f"got {response_type}\033[0m")
+        print(f"  \033[31m[协议] 类型不匹配: 期待 plan_approval_response, "
+              f"却收到了 {response_type}\033[0m")
         return
     state.status = "approved" if approve else "rejected"
     icon = "✓" if approve else "✗"
     color = "32" if approve else "31"
-    print(f"  \033[{color}m[protocol] {state.type} {icon} "
+    print(f"  \033[{color}m[协议] {state.type} {icon} "
           f"({request_id}: {state.status})\033[0m")
 
 
-# ── Autonomous Agent (s17 new) ──
+# ── 自主智能体（s17 新增） ──
 
-IDLE_POLL_INTERVAL = 5   # seconds
-IDLE_TIMEOUT = 60         # seconds
+IDLE_POLL_INTERVAL = 5   # 秒
+IDLE_TIMEOUT = 60         # 秒
 
 
 def scan_unclaimed_tasks() -> list[dict]:
-    """Find pending, unowned tasks with all dependencies completed."""
+    """在任务板上寻找处于 pending、无主且依赖已完成的任务。"""
     unclaimed = []
     for f in sorted(TASKS_DIR.glob("task_*.json")):
         task = json.loads(f.read_text())
@@ -303,71 +304,72 @@ def scan_unclaimed_tasks() -> list[dict]:
 
 def idle_poll(agent_name: str, messages: list,
               name: str, role: str) -> str:
-    """Poll for 60s. Return 'work', 'shutdown', or 'timeout'."""
+    """轮询 60 秒。返回 'work', 'shutdown', 或 'timeout'。
+    就像是一个耐心的守望者，在寂静中寻找被需要的理由。"""
     for _ in range(IDLE_TIMEOUT // IDLE_POLL_INTERVAL):
         time.sleep(IDLE_POLL_INTERVAL)
 
-        # Check inbox — dispatch protocol messages first
+        # 检查邮箱 — 协议消息享有最高优先级
         inbox = BUS.read_inbox(agent_name)
         if inbox:
-            # Check for shutdown_request
+            # 检查是否有优雅停机请求
             for msg in inbox:
                 if msg.get("type") == "shutdown_request":
                     req_id = msg.get("metadata", {}).get("request_id", "")
-                    BUS.send(name, "lead", "Shutting down gracefully.",
+                    BUS.send(name, "lead", "正在优雅停机，江湖再见。",
                              "shutdown_response",
                              {"request_id": req_id, "approve": True})
-                    print(f"  \033[35m[protocol] {name} approved shutdown "
-                          f"in idle ({req_id})\033[0m")
+                    print(f"  \033[35m[协议] {name} 在空闲时批准了停机请求 "
+                          f"({req_id})\033[0m")
                     return "shutdown"
 
-            # Non-protocol inbox: inject and resume work
+            # 非协议消息: 注入历史并重返工作
             messages.append({"role": "user",
                 "content": "<inbox>" + json.dumps(inbox) + "</inbox>"})
-            print(f"  \033[36m[idle] {name} found inbox messages\033[0m")
+            print(f"  \033[36m[空闲] {name} 收到了新的邮箱消息\033[0m")
             return "work"
 
-        # Scan task board
+        # 扫描任务板
         unclaimed = scan_unclaimed_tasks()
         if unclaimed:
             task = unclaimed[0]
             result = claim_task(task["id"], agent_name)
-            if "Claimed" in result:
+            if "已认领" in result or "Claimed" in result:
                 messages.append({"role": "user",
-                    "content": f"<auto-claimed>Task {task['id']}: "
+                    "content": f"<auto-claimed>任务 {task['id']}: "
                                f"{task['subject']}</auto-claimed>"})
-                print(f"  \033[32m[idle] {name} auto-claimed: "
+                print(f"  \033[32m[空闲] {name} 自动认领了: "
                       f"{task['subject']}\033[0m")
                 return "work"
-            print(f"  \033[33m[idle] {name} claim failed: "
+            print(f"  \033[33m[空闲] {name} 认领失败: "
                   f"{result}\033[0m")
 
-    print(f"  \033[31m[idle] {name} timeout ({IDLE_TIMEOUT}s)\033[0m")
+    print(f"  \033[31m[空闲] {name} 等待超时 ({IDLE_TIMEOUT}s)\033[0m")
     return "timeout"
 
 
-# ── Teammate Thread (from s15 + s16 + s17) ──
+# ── 队友线程（融合 s15 + s16 + s17） ──
 
 def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
     if name in active_teammates:
-        return f"Teammate '{name}' already exists"
+        return f"队友 '{name}' 已经存在了"
 
-    system = (f"You are '{name}', a {role}. "
-              f"Use tools to complete tasks. "
-              f"You can list and claim tasks from the board. "
-              f"Check inbox for protocol messages.")
+    system = (f"你是 '{name}'，一位 {role}。"
+              f"请使用工具完成任务。"
+              f"你可以从任务板上查看并认领任务。"
+              f"随时检查邮箱里的协议消息。")
 
     def handle_inbox_message(name: str, msg: dict, messages: list):
-        """Dispatch incoming protocol messages by type."""
+        """根据类型分发收到的协议消息。"""
         msg_type = msg.get("type", "message")
         meta = msg.get("metadata", {})
         req_id = meta.get("request_id", "")
 
         if msg_type == "shutdown_request":
-            BUS.send(name, "lead", "Shutting down gracefully.",
+            BUS.send(name, "lead", "正在优雅停机，江湖再见。",
                      "shutdown_response",
                      {"request_id": req_id, "approve": True})
-            print(f"  \033[35m[protocol] {name} approved shutdown "
+            print(f"  \033[35m[协议] {name} 批准了停机请求 "
                   f"({req_id})\033[0m")
             return True
 
@@ -375,51 +377,51 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
             approve = meta.get("approve", False)
             if approve:
                 messages.append({"role": "user",
-                    "content": "[Plan approved] Proceed with the task."})
+                    "content": "[计划已批准] 放手去做吧。"})
             else:
                 messages.append({"role": "user",
-                    "content": f"[Plan rejected] Feedback: {msg['content']}"})
+                    "content": f"[计划被驳回] 反馈意见: {msg['content']}"})
         return False
 
     def run():
         messages = [{"role": "user", "content": prompt}]
         sub_tools = [
-            {"name": "bash", "description": "Run a shell command.",
+            {"name": "bash", "description": "执行 shell 命令。",
              "input_schema": {"type": "object",
                               "properties": {"command": {"type": "string"}},
                               "required": ["command"]}},
-            {"name": "read_file", "description": "Read file.",
+            {"name": "read_file", "description": "读取文件。",
              "input_schema": {"type": "object",
                               "properties": {"path": {"type": "string"}},
                               "required": ["path"]}},
-            {"name": "write_file", "description": "Write file.",
+            {"name": "write_file", "description": "写入文件。",
              "input_schema": {"type": "object",
                               "properties": {"path": {"type": "string"},
                                              "content": {"type": "string"}},
                               "required": ["path", "content"]}},
             {"name": "send_message",
-             "description": "Send message to another agent.",
+             "description": "发送消息给其他智能体。",
              "input_schema": {"type": "object",
                               "properties": {"to": {"type": "string"},
                                              "content": {"type": "string"}},
                               "required": ["to", "content"]}},
             {"name": "submit_plan",
-             "description": "Submit a plan for Lead approval.",
+             "description": "提交计划给 Lead 审批。",
              "input_schema": {"type": "object",
                               "properties": {"plan": {"type": "string"}},
                               "required": ["plan"]}},
-            # s17 new: teammates can list, claim, and complete tasks
+            # s17 新增: 队友现在能列出、认领并完成任务了
             {"name": "list_tasks",
-             "description": "List all tasks on the board.",
+             "description": "列出任务板上的所有任务。",
              "input_schema": {"type": "object", "properties": {},
                               "required": []}},
             {"name": "claim_task",
-             "description": "Claim a pending task.",
+             "description": "认领一个待处理的任务。",
              "input_schema": {"type": "object",
                               "properties": {"task_id": {"type": "string"}},
                               "required": ["task_id"]}},
             {"name": "complete_task",
-             "description": "Mark an in-progress task as completed.",
+             "description": "将一个处理中的任务标记为完成。",
              "input_schema": {"type": "object",
                               "properties": {"task_id": {"type": "string"}},
                               "required": ["task_id"]}},
@@ -428,7 +430,7 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
         def _run_list_tasks():
             tasks = list_tasks()
             if not tasks:
-                return "No tasks."
+                return "没有任务哦。"
             return "\n".join(
                 f"  {t.id}: {t.subject} [{t.status}]"
                 for t in tasks)
@@ -442,22 +444,22 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
         sub_handlers = {
             "bash": run_bash, "read_file": run_read, "write_file": run_write,
             "send_message": lambda to, content: (BUS.send(name, to, content),
-                                                  "Sent")[1],
+                                                  "已发送")[1],
             "submit_plan": lambda plan: _teammate_submit_plan(name, plan),
             "list_tasks": _run_list_tasks,
             "claim_task": _run_claim_task,
             "complete_task": _run_complete_task,
         }
 
-        # Outer loop: WORK → IDLE cycle
+        # 外层循环: WORK (工作) → IDLE (空闲) 的轮回
         while True:
-            # Identity re-injection (s17)
+            # 身份重新注入 (s17 灵魂锚点): 在长对话压缩后唤醒自我认知
             if len(messages) <= 3:
                 messages.insert(0, {"role": "user",
-                    "content": f"<identity>You are '{name}', role: {role}. "
-                               f"Continue your work.</identity>"})
+                    "content": f"<identity>你是 '{name}'，角色: {role}。"
+                               f"请继续你的工作吧。</identity>"})
 
-            # WORK phase
+            # WORK 阶段
             should_shutdown = False
             for _ in range(10):
                 inbox = BUS.read_inbox(name)
@@ -488,7 +490,7 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
                 for block in response.content:
                     if block.type == "tool_use":
                         handler = sub_handlers.get(block.name)
-                        output = handler(**block.input) if handler else "Unknown"
+                        output = handler(**block.input) if handler else "未知的工具"
                         results.append({"type": "tool_result",
                                         "tool_use_id": block.id,
                                         "content": str(output)})
@@ -497,15 +499,15 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
             if should_shutdown:
                 break
 
-            # IDLE phase (s17 new)
+            # IDLE 阶段 (s17 新增)
             idle_result = idle_poll(name, messages, name, role)
             if idle_result == "shutdown":
                 break
             if idle_result == "timeout":
                 break
 
-        # Summary
-        summary = "Done."
+        # 曲终人散的总结
+        summary = "任务完成。"
         for msg in reversed(messages):
             if msg["role"] == "assistant" and isinstance(msg["content"], list):
                 for b in msg["content"]:
@@ -517,16 +519,16 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
                 break
         BUS.send(name, "lead", summary, "result")
         active_teammates.pop(name, None)
-        print(f"  \033[32m[teammate] {name} finished\033[0m")
+        print(f"  \033[32m[队友] {name} 已退场\033[0m")
 
     active_teammates[name] = True
     threading.Thread(target=run, daemon=True).start()
-    print(f"  \033[36m[teammate] {name} spawned as {role}\033[0m")
-    return f"Teammate '{name}' spawned as {role} (autonomous)"
+    print(f"  \033[36m[队友] {name} 已作为 {role} 孵化\033[0m")
+    return f"队友 '{name}' 已作为 {role} 孵化 (拥有自主权)"
 
 
 def _teammate_submit_plan(from_name: str, plan: str) -> str:
-    """Teammate submits a plan to Lead for approval."""
+    """队友向 Lead 提交计划供审批。"""
     req_id = new_request_id()
     pending_requests[req_id] = ProtocolState(
         request_id=req_id, type="plan_approval",
@@ -535,10 +537,10 @@ def _teammate_submit_plan(from_name: str, plan: str) -> str:
     BUS.send(from_name, "lead", plan,
              "plan_approval_request",
              {"request_id": req_id})
-    return f"Plan submitted ({req_id}). Waiting for approval..."
+    return f"计划已提交 ({req_id})。静候佳音..."
 
 
-# ── Lead Protocol Tools (from s16) ──
+# ── Lead 协议工具（继承自 s16） ──
 
 def run_request_shutdown(teammate: str) -> str:
     req_id = new_request_id()
@@ -546,52 +548,52 @@ def run_request_shutdown(teammate: str) -> str:
         request_id=req_id, type="shutdown",
         sender="lead", target=teammate,
         status="pending", payload="")
-    BUS.send("lead", teammate, "Please shut down gracefully.",
+    BUS.send("lead", teammate, "请优雅地停机吧。",
              "shutdown_request",
              {"request_id": req_id})
-    print(f"  \033[35m[protocol] shutdown_request → {teammate} "
+    print(f"  \033[35m[协议] shutdown_request → {teammate} "
           f"({req_id})\033[0m")
-    return f"Shutdown request sent to {teammate} (req: {req_id})"
+    return f"停机请求已发送给 {teammate} (req: {req_id})"
 
 
 def run_request_plan(teammate: str, task: str) -> str:
-    """Lead asks a teammate to submit a plan."""
-    BUS.send("lead", teammate, f"Please submit a plan for: {task}",
+    """Lead 要求队友提交计划。"""
+    BUS.send("lead", teammate, f"请为这个任务提交一份计划: {task}",
              "message")
-    return f"Asked {teammate} to submit a plan"
+    return f"已要求 {teammate} 提交计划"
 
 
 def run_review_plan(request_id: str, approve: bool,
                     feedback: str = "") -> str:
     state = pending_requests.get(request_id)
     if not state:
-        return f"Request {request_id} not found"
+        return f"找不到请求 {request_id}"
     if state.status != "pending":
-        return f"Request {request_id} already {state.status}"
+        return f"请求 {request_id} 已经是 {state.status} 状态了"
     state.status = "approved" if approve else "rejected"
     BUS.send("lead", state.sender,
-             feedback or ("Approved" if approve else "Rejected"),
+             feedback or ("已批准" if approve else "已驳回"),
              "plan_approval_response",
              {"request_id": request_id, "approve": approve})
     icon = "✓" if approve else "✗"
-    print(f"  \033[32m[protocol] plan {icon} ({request_id})\033[0m")
-    return f"Plan {'approved' if approve else 'rejected'} ({request_id})"
+    print(f"  \033[32m[协议] 计划 {icon} ({request_id})\033[0m")
+    return f"计划{'已批准' if approve else '已驳回'} ({request_id})"
 
 
-# ── Basic tool handlers ──
+# ── 基础工具处理器 ──
 
 def run_create_task(subject: str, description: str = "",
                     blockedBy: list[str] | None = None) -> str:
     task = create_task(subject, description, blockedBy)
-    deps = f" (blockedBy: {', '.join(blockedBy)})" if blockedBy else ""
-    print(f"  \033[34m[create] {task.subject}{deps}\033[0m")
-    return f"Created {task.id}: {task.subject}{deps}"
+    deps = f" (被阻塞: {', '.join(blockedBy)})" if blockedBy else ""
+    print(f"  \033[34m[创建] {task.subject}{deps}\033[0m")
+    return f"已创建 {task.id}: {task.subject}{deps}"
 
 
 def run_list_tasks() -> str:
     tasks = list_tasks()
     if not tasks:
-        return "No tasks."
+        return "空空如也。"
     return "\n".join(
         f"  {t.id}: {t.subject} [{t.status}]"
         for t in tasks)
@@ -615,11 +617,11 @@ def run_spawn_teammate(name: str, role: str, prompt: str) -> str:
 
 def run_send_message(to: str, content: str) -> str:
     BUS.send("lead", to, content)
-    return f"Sent to {to}"
+    return f"已发送给 {to}"
 
 
 def consume_lead_inbox(route_protocol=True) -> list[dict]:
-    """Read Lead inbox: route protocol responses, return all messages."""
+    """读取 Lead 邮箱: 路由协议响应，返回所有消息。"""
     msgs = BUS.read_inbox("lead")
     if route_protocol:
         for msg in msgs:
@@ -634,7 +636,7 @@ def consume_lead_inbox(route_protocol=True) -> list[dict]:
 def run_check_inbox() -> str:
     msgs = consume_lead_inbox(route_protocol=True)
     if not msgs:
-        return "(inbox empty)"
+        return "(邮箱空空如也)"
     lines = []
     for m in msgs:
         meta = m.get("metadata", {})
@@ -644,25 +646,25 @@ def run_check_inbox() -> str:
     return "\n".join(lines)
 
 
-# ── Tool Definitions ──
+# ── 工具定义 ──
 
 TOOLS = [
-    {"name": "bash", "description": "Run a shell command.",
+    {"name": "bash", "description": "执行 shell 命令。",
      "input_schema": {"type": "object",
                       "properties": {"command": {"type": "string"}},
                       "required": ["command"]}},
-    {"name": "read_file", "description": "Read file contents.",
+    {"name": "read_file", "description": "读取文件内容。",
      "input_schema": {"type": "object",
                       "properties": {"path": {"type": "string"},
                                      "limit": {"type": "integer"}},
                       "required": ["path"]}},
-    {"name": "write_file", "description": "Write content to a file.",
+    {"name": "write_file", "description": "向文件写入内容。",
      "input_schema": {"type": "object",
                       "properties": {"path": {"type": "string"},
                                      "content": {"type": "string"}},
                       "required": ["path", "content"]}},
     {"name": "create_task",
-     "description": "Create a task.",
+     "description": "创建一个任务。",
      "input_schema": {"type": "object",
                       "properties": {"subject": {"type": "string"},
                                      "description": {"type": "string"},
@@ -670,52 +672,52 @@ TOOLS = [
                                                    "items": {"type": "string"}}},
                       "required": ["subject"]}},
     {"name": "list_tasks",
-     "description": "List all tasks.",
+     "description": "列出所有任务。",
      "input_schema": {"type": "object", "properties": {}, "required": []}},
     {"name": "get_task",
-     "description": "Get full details of a specific task.",
+     "description": "获取特定任务的完整细节。",
      "input_schema": {"type": "object",
                       "properties": {"task_id": {"type": "string"}},
                       "required": ["task_id"]}},
     {"name": "claim_task",
-     "description": "Claim a pending task.",
+     "description": "认领一个待处理的任务。",
      "input_schema": {"type": "object",
                       "properties": {"task_id": {"type": "string"}},
                       "required": ["task_id"]}},
     {"name": "complete_task",
-     "description": "Complete an in-progress task.",
+     "description": "完成一个进行中的任务。",
      "input_schema": {"type": "object",
                       "properties": {"task_id": {"type": "string"}},
                       "required": ["task_id"]}},
     {"name": "spawn_teammate",
-     "description": "Spawn an autonomous teammate agent.",
+     "description": "孵化一个自主的队友智能体。",
      "input_schema": {"type": "object",
                       "properties": {"name": {"type": "string"},
                                      "role": {"type": "string"},
                                      "prompt": {"type": "string"}},
                       "required": ["name", "role", "prompt"]}},
     {"name": "send_message",
-     "description": "Send message to a teammate.",
+     "description": "向队友发送消息。",
      "input_schema": {"type": "object",
                       "properties": {"to": {"type": "string"},
                                      "content": {"type": "string"}},
                       "required": ["to", "content"]}},
     {"name": "check_inbox",
-     "description": "Check inbox for messages and protocol responses.",
+     "description": "检查邮箱里的消息和协议响应。",
      "input_schema": {"type": "object", "properties": {}, "required": []}},
     {"name": "request_shutdown",
-     "description": "Request a teammate to shut down gracefully.",
+     "description": "请求队友优雅停机。",
      "input_schema": {"type": "object",
                       "properties": {"teammate": {"type": "string"}},
                       "required": ["teammate"]}},
     {"name": "request_plan",
-     "description": "Ask a teammate to submit a plan for review.",
+     "description": "要求队友提交一份计划供审批。",
      "input_schema": {"type": "object",
                       "properties": {"teammate": {"type": "string"},
                                      "task": {"type": "string"}},
                       "required": ["teammate", "task"]}},
     {"name": "review_plan",
-     "description": "Approve or reject a submitted plan.",
+     "description": "批准或驳回提交的计划。",
      "input_schema": {"type": "object",
                       "properties": {
                           "request_id": {"type": "string"},
@@ -736,7 +738,7 @@ TOOL_HANDLERS = {
 }
 
 
-# ── Context ──
+# ── 上下文 ──
 
 MEMORY_DIR = WORKDIR / ".memory"
 MEMORY_INDEX = MEMORY_DIR / "MEMORY.md"
@@ -749,7 +751,7 @@ def update_context(context: dict, messages: list) -> dict:
     return {"memories": memories}
 
 
-# ── Agent Loop ──
+# ── 智能体主循环 ──
 
 def agent_loop(messages: list, context: dict):
     system = get_system_prompt(context)
@@ -773,7 +775,7 @@ def agent_loop(messages: list, context: dict):
                 continue
             print(f"\033[36m> {block.name}\033[0m")
             handler = TOOL_HANDLERS.get(block.name)
-            output = handler(**block.input) if handler else "Unknown"
+            output = handler(**block.input) if handler else "未知的工具"
             print(str(output)[:300])
             results.append({"type": "tool_result",
                             "tool_use_id": block.id, "content": output})
@@ -783,8 +785,8 @@ def agent_loop(messages: list, context: dict):
 
 
 if __name__ == "__main__":
-    print("s17: autonomous agents")
-    print("Enter a question, press Enter to send. Type q to quit.\n")
+    print("s17: 自主智能体 (Autonomous Agents)")
+    print("输入问题并按回车发送。输入 q 退出。\n")
     history = []
     context = {"memories": ""}
     while True:
@@ -801,12 +803,12 @@ if __name__ == "__main__":
             if getattr(block, "type", None) == "text":
                 print(block.text)
 
-        # Consume lead inbox: route protocol + inject into history
+        # 消费 Lead 邮箱: 路由协议 + 注入历史记录
         inbox = consume_lead_inbox(route_protocol=True)
         if inbox:
             inbox_text = "\n".join(
-                f"From {m['from']} [{m.get('type', 'message')}]: "
+                f"来自 {m['from']} [{m.get('type', 'message')}]: "
                 f"{m['content'][:200]}" for m in inbox)
             history.append({"role": "user",
-                            "content": f"[Inbox]\n{inbox_text}"})
+                            "content": f"[收件箱]\n{inbox_text}"})
         print()

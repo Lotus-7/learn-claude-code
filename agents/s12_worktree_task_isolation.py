@@ -36,6 +36,7 @@ import re
 import subprocess
 import time
 from pathlib import Path
+from typing import Optional
 
 from anthropic import Anthropic
 from dotenv import load_dotenv
@@ -90,9 +91,9 @@ class EventBus:
     def emit(
         self,
         event: str,
-        task: dict | None = None,
-        worktree: dict | None = None,
-        error: str | None = None,
+        task: Optional[dict] = None,
+        worktree: Optional[dict] = None,
+        error: Optional[str] = None,
     ):
         payload = {
             "event": event,
@@ -268,7 +269,7 @@ class WorktreeManager:
     def _save_index(self, data: dict):
         self.index_path.write_text(json.dumps(data, indent=2))
 
-    def _find(self, name: str) -> dict | None:
+    def _find(self, name: str) -> Optional[dict]:
         idx = self._load_index()
         for wt in idx.get("worktrees", []):
             if wt.get("name") == name:

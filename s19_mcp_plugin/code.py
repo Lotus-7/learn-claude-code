@@ -1,28 +1,29 @@
 #!/usr/bin/env python3
 """
-s19: MCP Tools — MCPClient + tool discovery + assemble_tool_pool.
+s19: MCP 插件 —— MCPClient + 工具发现 + 动态工具池组装。
 
-Run:  python s19_mcp_plugin/code.py
-Need: pip install anthropic python-dotenv + .env with ANTHROPIC_API_KEY
+运行:  python s19_mcp_plugin/code.py
+依赖: pip install anthropic python-dotenv + .env 配置 ANTHROPIC_API_KEY
 
-Changes from s18:
-  - MCPClient class: discovers tools, calls tools via mock handler
-  - normalize_mcp_name: normalize tool/server names
-  - assemble_tool_pool: assembles builtin + MCP tools into one pool
-  - connect_mcp: connect to an MCP server, discover tools
-  - Tool naming: mcp__{server}__{tool} with normalization
-  - MCP tools have readOnly/destructive annotations
-  - agent_loop uses dynamic tool pool (builtin + MCP), no prompt cache
-  - Teammate tools: complete_task, worktree cwd (from s17/s18 fixes)
+s18 到 s19 的蜕变:
+  - MCPClient 类: 发现外部工具，并通过模拟处理器调用工具
+  - normalize_mcp_name: 对工具/服务器名称进行规范化，防止奇怪字符作祟
+  - assemble_tool_pool: 将内置工具与 MCP 工具无缝组装进同一个工具池
+  - connect_mcp: 连接到 MCP 服务器，并探索可用的工具
+  - 工具命名法: mcp__{server}__{tool} (经过规范化处理)
+  - MCP 工具带有 readOnly/destructive 等特性标注
+  - agent_loop 使用动态的工具池 (内置 + MCP)，不再使用静态的提示词缓存
+  - 队友工具: complete_task, 以及工作树 cwd (修复自 s17/s18)
 
-ASCII flow:
-  connect_mcp("docs") → MCPClient discovers tools →
-  assemble_tool_pool → [builtin... , mcp__docs__search, mcp__docs__get_version]
-  agent_loop uses assembled pool
+ASCII 流程图 (插件的魔法):
+  connect_mcp("docs") → MCPClient 发现工具 →
+  assemble_tool_pool → [内置工具... , mcp__docs__search, mcp__docs__get_version]
+  agent_loop 使用组装后的全新工具池
 """
 
 import os, subprocess, json, time, random, threading, re
 from pathlib import Path
+from typing import Optional
 from datetime import datetime
 from dataclasses import dataclass, asdict, field
 
@@ -41,9 +42,9 @@ if os.getenv("ANTHROPIC_BASE_URL"):
 
 WORKDIR = Path.cwd()
 client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
-MODEL = os.environ["MODEL_ID"]
+MODEL = os.getenv("MODEL_ID", "deepseek-v4-pro")
 
-# ── Task System ──
+# ── 任务系统 ──
 
 TASKS_DIR = WORKDIR / ".tasks"
 TASKS_DIR.mkdir(exist_ok=True)
@@ -55,9 +56,9 @@ class Task:
     subject: str
     description: str
     status: str
-    owner: str | None
+    owner: Optional[str]
     blockedBy: list[str]
-    worktree: str | None = None
+    worktree: Optional[str] = None
 
 
 def _task_path(task_id: str) -> Path:
@@ -106,40 +107,40 @@ def can_start(task_id: str) -> bool:
 def claim_task(task_id: str, owner: str = "agent") -> str:
     task = load_task(task_id)
     if task.status != "pending":
-        return f"Task {task_id} is {task.status}, cannot claim"
+        return f"任务 {task_id} 状态为 {task.status}，无法认领"
     if task.owner:
-        return f"Task {task_id} already owned by {task.owner}"
+        return f"任务 {task_id} 已由 {task.owner} 负责"
     if not can_start(task_id):
         deps = [d for d in task.blockedBy
                 if _task_path(d).exists() and load_task(d).status != "completed"]
         missing = [d for d in task.blockedBy if not _task_path(d).exists()]
         parts = []
-        if deps: parts.append(f"blocked by: {deps}")
-        if missing: parts.append(f"missing deps: {missing}")
-        return "Cannot start — " + ", ".join(parts)
+        if deps: parts.append(f"被以下阻塞: {deps}")
+        if missing: parts.append(f"缺失的依赖: {missing}")
+        return "无法开始 — " + ", ".join(parts)
     task.owner = owner
     task.status = "in_progress"
     save_task(task)
-    print(f"  \033[36m[claim] {task.subject} → in_progress\033[0m")
-    return f"Claimed {task.id} ({task.subject})"
+    print(f"  \033[36m[认领] {task.subject} → in_progress\033[0m")
+    return f"已认领 {task.id} ({task.subject})"
 
 
 def complete_task(task_id: str) -> str:
     task = load_task(task_id)
     if task.status != "in_progress":
-        return f"Task {task_id} is {task.status}, cannot complete"
+        return f"任务 {task_id} 状态为 {task.status}，无法标记完成"
     task.status = "completed"
     save_task(task)
     unblocked = [t.subject for t in list_tasks()
                  if t.status == "pending" and t.blockedBy and can_start(t.id)]
-    print(f"  \033[32m[complete] {task.subject} ✓\033[0m")
-    msg = f"Completed {task.id} ({task.subject})"
+    print(f"  \033[32m[完成] {task.subject} ✓\033[0m")
+    msg = f"已完成 {task.id} ({task.subject})"
     if unblocked:
-        msg += f"\nUnblocked: {', '.join(unblocked)}"
+        msg += f"\n解锁新任务: {', '.join(unblocked)}"
     return msg
 
 
-# ── Worktree System ──
+# ── 工作树系统 ──
 
 WORKTREES_DIR = WORKDIR / ".worktrees"
 WORKTREES_DIR.mkdir(exist_ok=True)
@@ -147,14 +148,14 @@ WORKTREES_DIR.mkdir(exist_ok=True)
 VALID_WT_NAME = re.compile(r'^[A-Za-z0-9._-]{1,64}$')
 
 
-def validate_worktree_name(name: str) -> str | None:
+def validate_worktree_name(name: str) -> Optional[str]:
     if not name:
-        return "Worktree name cannot be empty"
+        return "工作树名称不能为空"
     if name in (".", ".."):
-        return f"'{name}' is not a valid worktree name"
+        return f"'{name}' 不是一个有效的工作树名称"
     if not VALID_WT_NAME.match(name):
-        return (f"Invalid worktree name '{name}': "
-                "only letters, digits, dots, underscores, dashes (1-64 chars)")
+        return (f"无效的工作树名称 '{name}': "
+                "只能包含字母、数字、点、下划线、破折号 (1-64个字符)")
     return None
 
 
@@ -163,9 +164,9 @@ def run_git(args: list[str]) -> tuple[bool, str]:
         r = subprocess.run(["git"] + args, cwd=WORKDIR,
                            capture_output=True, text=True, timeout=30)
         out = (r.stdout + r.stderr).strip()
-        return r.returncode == 0, out[:5000] if out else "(no output)"
+        return r.returncode == 0, out[:5000] if out else "(无输出)"
     except subprocess.TimeoutExpired:
-        return False, "Error: git timeout"
+        return False, "错误: git 执行超时"
 
 
 def log_event(event_type: str, worktree_name: str, task_id: str = ""):
@@ -179,18 +180,18 @@ def log_event(event_type: str, worktree_name: str, task_id: str = ""):
 def create_worktree(name: str, task_id: str = "") -> str:
     err = validate_worktree_name(name)
     if err:
-        return f"Error: {err}"
+        return f"错误: {err}"
     path = WORKTREES_DIR / name
     if path.exists():
-        return f"Worktree '{name}' already exists at {path}"
+        return f"工作树 '{name}' 已经存在于 {path}"
     ok, result = run_git(["worktree", "add", str(path), "-b", f"wt/{name}", "HEAD"])
     if not ok:
-        return f"Git error: {result}"
+        return f"Git 错误: {result}"
     if task_id:
         bind_task_to_worktree(task_id, name)
     log_event("create", name, task_id)
-    print(f"  \033[33m[worktree] created: {name} at {path}\033[0m")
-    return f"Worktree '{name}' created at {path}"
+    print(f"  \033[33m[工作树] 已创建: {name} 位于 {path}\033[0m")
+    return f"工作树 '{name}' 已创建在 {path}"
 
 
 def bind_task_to_worktree(task_id: str, worktree_name: str):
@@ -218,21 +219,21 @@ def remove_worktree(name: str, discard_changes: bool = False) -> str:
         return err
     path = WORKTREES_DIR / name
     if not path.exists():
-        return f"Worktree '{name}' not found"
+        return f"找不到工作树 '{name}'"
     if not discard_changes:
         files, commits = _count_worktree_changes(path)
         if files < 0:
-            return "Cannot verify status. Use discard_changes=true to force."
+            return "无法验证状态。请使用 discard_changes=true 强制移除。"
         if files > 0 or commits > 0:
-            return (f"Worktree '{name}' has {files} file(s), {commits} commit(s). "
-                    "Use discard_changes=true or keep_worktree.")
+            return (f"工作树 '{name}' 有 {files} 个文件, {commits} 个提交。 "
+                    "请使用 discard_changes=true 或 keep_worktree。")
     ok1, _ = run_git(["worktree", "remove", str(path), "--force"])
     if not ok1:
-        return f"Failed to remove worktree '{name}'"
+        return f"无法移除工作树 '{name}'"
     run_git(["branch", "-D", f"wt/{name}"])
     log_event("remove", name)
-    print(f"  \033[33m[worktree] removed: {name}\033[0m")
-    return f"Worktree '{name}' removed"
+    print(f"  \033[33m[工作树] 已移除: {name}\033[0m")
+    return f"工作树 '{name}' 已移除"
 
 
 def keep_worktree(name: str) -> str:
@@ -240,21 +241,21 @@ def keep_worktree(name: str) -> str:
     if err:
         return err
     log_event("keep", name)
-    return f"Worktree '{name}' kept for review (branch: wt/{name})"
+    return f"工作树 '{name}' 已保留以供审查 (分支: wt/{name})"
 
 
-# ── Prompt Assembly ──
+# ── 提示词组装 ──
 
 PROMPT_SECTIONS = {
-    "identity": "You are a coding agent. Act, don't explain.",
-    "tools": "Available tools: bash, read_file, write_file, "
+    "identity": "你是一个编码智能体。少解释，多做事。",
+    "tools": "可用工具: bash, read_file, write_file, "
              "create_task, list_tasks, get_task, claim_task, complete_task, "
              "spawn_teammate, send_message, check_inbox, "
              "request_shutdown, request_plan, review_plan, "
              "create_worktree, remove_worktree, keep_worktree, "
-             "connect_mcp. MCP tools are prefixed mcp__{server}__{tool}.",
-    "workspace": f"Working directory: {WORKDIR}",
-    "memory": "Relevant memories are injected below when available.",
+             "connect_mcp. MCP 插件工具的前缀为 mcp__{server}__{tool}。",
+    "workspace": f"工作目录: {WORKDIR}",
+    "memory": "相关的记忆会在可用时注入到下方，它们是你灵魂的锚点。",
 }
 
 
@@ -263,20 +264,20 @@ def assemble_system_prompt(context: dict) -> str:
                 PROMPT_SECTIONS["tools"],
                 PROMPT_SECTIONS["workspace"]]
     if context.get("memories"):
-        sections.append(f"Relevant memories:\n{context['memories']}")
+        sections.append(f"相关记忆:\n{context['memories']}")
     mcp_names = list(mcp_clients.keys())
     if mcp_names:
-        sections.append(f"Connected MCP servers: {', '.join(mcp_names)}")
+        sections.append(f"已连接的 MCP 服务器: {', '.join(mcp_names)}")
     return "\n\n".join(sections)
 
 
-# ── Basic Tools ──
+# ── 基础工具 ──
 
 def safe_path(p: str, cwd: Path = None) -> Path:
     base = cwd or WORKDIR
     path = (base / p).resolve()
     if not path.is_relative_to(base):
-        raise ValueError(f"Path escapes workspace: {p}")
+        raise ValueError(f"路径试图逃离工作区: {p}")
     return path
 
 
@@ -285,19 +286,19 @@ def run_bash(command: str, cwd: Path = None) -> str:
         r = subprocess.run(command, shell=True, cwd=cwd or WORKDIR,
                            capture_output=True, text=True, timeout=120)
         out = (r.stdout + r.stderr).strip()
-        return out[:50000] if out else "(no output)"
+        return out[:50000] if out else "(无输出)"
     except subprocess.TimeoutExpired:
-        return "Error: Timeout (120s)"
+        return "错误: 执行超时 (120s)"
 
 
-def run_read(path: str, limit: int | None = None, cwd: Path = None) -> str:
+def run_read(path: str, limit: Optional[int] = None, cwd: Path = None) -> str:
     try:
         lines = safe_path(path, cwd).read_text().splitlines()
         if limit and limit < len(lines):
-            lines = lines[:limit] + [f"... ({len(lines) - limit} more lines)"]
+            lines = lines[:limit] + [f"... (还有 {len(lines) - limit} 行)"]
         return "\n".join(lines)
     except Exception as e:
-        return f"Error: {e}"
+        return f"读取错误: {e}"
 
 
 def run_write(path: str, content: str, cwd: Path = None) -> str:
@@ -305,12 +306,12 @@ def run_write(path: str, content: str, cwd: Path = None) -> str:
         fp = safe_path(path, cwd)
         fp.parent.mkdir(parents=True, exist_ok=True)
         fp.write_text(content)
-        return f"Wrote {len(content)} bytes to {path}"
+        return f"成功写入 {len(content)} 字节到 {path}"
     except Exception as e:
-        return f"Error: {e}"
+        return f"写入错误: {e}"
 
 
-# ── MessageBus ──
+# ── 消息总线 ──
 
 MAILBOX_DIR = WORKDIR / ".mailboxes"
 MAILBOX_DIR.mkdir(exist_ok=True)
@@ -325,7 +326,7 @@ class MessageBus:
         inbox = MAILBOX_DIR / f"{to_agent}.jsonl"
         with open(inbox, "a") as f:
             f.write(json.dumps(msg) + "\n")
-        print(f"  \033[33m[bus] {from_agent} → {to_agent}: "
+        print(f"  \033[33m[总线] {from_agent} → {to_agent}: "
               f"({msg_type}) {content[:50]}\033[0m")
 
     def read_inbox(self, agent: str) -> list[dict]:
@@ -341,7 +342,7 @@ class MessageBus:
 BUS = MessageBus()
 active_teammates: dict[str, bool] = {}
 
-# ── Protocol State ──
+# ── 协议状态机 ──
 
 @dataclass
 class ProtocolState:
@@ -384,7 +385,7 @@ def consume_lead_inbox(route_protocol=True) -> list[dict]:
     return msgs
 
 
-# ── Autonomous Agent ──
+# ── 自主智能体 ──
 
 IDLE_POLL_INTERVAL = 5
 IDLE_TIMEOUT = 60
@@ -410,7 +411,7 @@ def idle_poll(agent_name: str, messages: list,
             for msg in inbox:
                 if msg.get("type") == "shutdown_request":
                     req_id = msg.get("metadata", {}).get("request_id", "")
-                    BUS.send(name, "lead", "Shutting down.",
+                    BUS.send(name, "lead", "正在停机。",
                              "shutdown_response",
                              {"request_id": req_id, "approve": True})
                     return "shutdown"
@@ -421,41 +422,41 @@ def idle_poll(agent_name: str, messages: list,
         if unclaimed:
             task_data = unclaimed[0]
             result = claim_task(task_data["id"], agent_name)
-            if "Claimed" in result:
+            if "已认领" in result or "Claimed" in result:
                 wt_info = ""
                 if task_data.get("worktree"):
-                    wt_info = f"\nWork directory: {WORKTREES_DIR / task_data['worktree']}"
+                    wt_info = f"\n工作目录: {WORKTREES_DIR / task_data['worktree']}"
                 messages.append({"role": "user",
-                    "content": f"<auto-claimed>Task {task_data['id']}: "
+                    "content": f"<auto-claimed>任务 {task_data['id']}: "
                                f"{task_data['subject']}{wt_info}</auto-claimed>"})
                 return "work"
     return "timeout"
 
 
-# ── Teammate Thread ──
+# ── 队友线程 ──
 
 def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
     if name in active_teammates:
-        return f"Teammate '{name}' already exists"
+        return f"队友 '{name}' 已经存在了"
 
-    system = (f"You are '{name}', a {role}. "
-              f"Use tools to complete tasks. "
-              f"If a task has a worktree, work in that directory.")
+    system = (f"你是 '{name}'，一位 {role}。"
+              f"请使用工具完成任务。"
+              f"如果任务绑定了工作树，请在那个目录下进行工作。")
 
     def handle_inbox_message(name: str, msg: dict, messages: list):
         msg_type = msg.get("type", "message")
         meta = msg.get("metadata", {})
         req_id = meta.get("request_id", "")
         if msg_type == "shutdown_request":
-            BUS.send(name, "lead", "Shutting down.",
+            BUS.send(name, "lead", "正在停机。",
                      "shutdown_response",
                      {"request_id": req_id, "approve": True})
             return True
         if msg_type == "plan_approval_response":
             approve = meta.get("approve", False)
             messages.append({"role": "user",
-                "content": "[Plan approved]" if approve
-                           else f"[Plan rejected] {msg['content']}"})
+                "content": "[计划已批准]" if approve
+                           else f"[计划被驳回] {msg['content']}"})
         return False
 
     def run():
@@ -477,15 +478,15 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
         def _run_list_tasks():
             tasks = list_tasks()
             if not tasks:
-                return "No tasks."
+                return "没有任务哦。"
             return "\n".join(
                 f"  {t.id}: {t.subject} [{t.status}]"
-                + (f" (wt:{t.worktree})" if t.worktree else "")
+                + (f" (工作树:{t.worktree})" if t.worktree else "")
                 for t in tasks)
 
         def _run_claim_task(task_id: str):
             result = claim_task(task_id, owner=name)
-            if "Claimed" in result:
+            if "已认领" in result or "Claimed" in result:
                 task = load_task(task_id)
                 wt_ctx["path"] = (str(WORKTREES_DIR / task.worktree)
                                   if task.worktree else None)
@@ -498,41 +499,41 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
 
         messages = [{"role": "user", "content": prompt}]
         sub_tools = [
-            {"name": "bash", "description": "Run a shell command.",
+            {"name": "bash", "description": "执行 shell 命令。",
              "input_schema": {"type": "object",
                               "properties": {"command": {"type": "string"}},
                               "required": ["command"]}},
-            {"name": "read_file", "description": "Read file.",
+            {"name": "read_file", "description": "读取文件。",
              "input_schema": {"type": "object",
                               "properties": {"path": {"type": "string"}},
                               "required": ["path"]}},
-            {"name": "write_file", "description": "Write file.",
+            {"name": "write_file", "description": "写入文件。",
              "input_schema": {"type": "object",
                               "properties": {"path": {"type": "string"},
                                              "content": {"type": "string"}},
                               "required": ["path", "content"]}},
             {"name": "send_message",
-             "description": "Send message to another agent.",
+             "description": "发送消息给其他智能体。",
              "input_schema": {"type": "object",
                               "properties": {"to": {"type": "string"},
                                              "content": {"type": "string"}},
                               "required": ["to", "content"]}},
             {"name": "submit_plan",
-             "description": "Submit a plan for Lead approval.",
+             "description": "提交计划给 Lead 审批。",
              "input_schema": {"type": "object",
                               "properties": {"plan": {"type": "string"}},
                               "required": ["plan"]}},
             {"name": "list_tasks",
-             "description": "List all tasks.",
+             "description": "列出所有任务。",
              "input_schema": {"type": "object", "properties": {},
                               "required": []}},
             {"name": "claim_task",
-             "description": "Claim a pending task.",
+             "description": "认领一个待处理的任务。",
              "input_schema": {"type": "object",
                               "properties": {"task_id": {"type": "string"}},
                               "required": ["task_id"]}},
             {"name": "complete_task",
-             "description": "Mark an in-progress task as completed.",
+             "description": "将一个处理中的任务标记为完成。",
              "input_schema": {"type": "object",
                               "properties": {"task_id": {"type": "string"}},
                               "required": ["task_id"]}},
@@ -542,7 +543,7 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
             "bash": _run_bash, "read_file": _run_read,
             "write_file": _run_write,
             "send_message": lambda to, content: (BUS.send(name, to, content),
-                                                  "Sent")[1],
+                                                  "已发送")[1],
             "submit_plan": lambda plan: _teammate_submit_plan(name, plan),
             "list_tasks": _run_list_tasks,
             "claim_task": _run_claim_task,
@@ -552,8 +553,8 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
         while True:
             if len(messages) <= 3:
                 messages.insert(0, {"role": "user",
-                    "content": f"<identity>You are '{name}', role: {role}. "
-                               f"Continue your work.</identity>"})
+                    "content": f"<identity>你是 '{name}'，角色: {role}。"
+                               f"请继续你的工作吧。</identity>"})
             should_shutdown = False
             for _ in range(10):
                 inbox = BUS.read_inbox(name)
@@ -583,7 +584,7 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
                 for block in response.content:
                     if block.type == "tool_use":
                         handler = sub_handlers.get(block.name)
-                        output = handler(**block.input) if handler else "Unknown"
+                        output = handler(**block.input) if handler else "未知的工具"
                         results.append({"type": "tool_result",
                                         "tool_use_id": block.id,
                                         "content": str(output)})
@@ -594,7 +595,7 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
             if idle_result in ("shutdown", "timeout"):
                 break
 
-        summary = "Done."
+        summary = "任务完成。"
         for msg in reversed(messages):
             if msg["role"] == "assistant" and isinstance(msg["content"], list):
                 for b in msg["content"]:
@@ -609,7 +610,7 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
 
     active_teammates[name] = True
     threading.Thread(target=run, daemon=True).start()
-    return f"Teammate '{name}' spawned as {role}"
+    return f"队友 '{name}' 已作为 {role} 孵化"
 
 
 def _teammate_submit_plan(from_name: str, plan: str) -> str:
@@ -621,10 +622,10 @@ def _teammate_submit_plan(from_name: str, plan: str) -> str:
     BUS.send(from_name, "lead", plan,
              "plan_approval_request",
              {"request_id": req_id})
-    return f"Plan submitted ({req_id})"
+    return f"计划已提交 ({req_id})"
 
 
-# ── Lead Protocol Tools ──
+# ── Lead 协议工具 ──
 
 def run_request_shutdown(teammate: str) -> str:
     req_id = new_request_id()
@@ -632,33 +633,33 @@ def run_request_shutdown(teammate: str) -> str:
         request_id=req_id, type="shutdown",
         sender="lead", target=teammate,
         status="pending", payload="")
-    BUS.send("lead", teammate, "Shut down.", "shutdown_request",
+    BUS.send("lead", teammate, "停机。", "shutdown_request",
              {"request_id": req_id})
-    return f"Shutdown request sent to {teammate}"
+    return f"停机请求已发送给 {teammate}"
 
 
 def run_request_plan(teammate: str, task: str) -> str:
-    BUS.send("lead", teammate, f"Submit plan for: {task}", "message")
-    return f"Asked {teammate} to submit a plan"
+    BUS.send("lead", teammate, f"请为以下任务提交计划: {task}", "message")
+    return f"已要求 {teammate} 提交计划"
 
 
 def run_review_plan(request_id: str, approve: bool,
                     feedback: str = "") -> str:
     state = pending_requests.get(request_id)
     if not state:
-        return f"Request {request_id} not found"
+        return f"找不到请求 {request_id}"
     state.status = "approved" if approve else "rejected"
     BUS.send("lead", state.sender,
-             feedback or ("Approved" if approve else "Rejected"),
+             feedback or ("已批准" if approve else "已驳回"),
              "plan_approval_response",
              {"request_id": request_id, "approve": approve})
-    return f"Plan {'approved' if approve else 'rejected'}"
+    return f"计划{'已批准' if approve else '已驳回'}"
 
 
-# ── MCP System (s19 new) ──
+# ── MCP 系统 (s19 新增) ──
 
 class MCPClient:
-    """Discovers and calls tools on an MCP server (mock for teaching)."""
+    """发现并调用 MCP 服务器上的工具（这里是教学版模拟实现）。"""
 
     def __init__(self, name: str):
         self.name = name
@@ -673,11 +674,11 @@ class MCPClient:
     def call_tool(self, tool_name: str, args: dict) -> str:
         handler = self._handlers.get(tool_name)
         if not handler:
-            return f"MCP error: unknown tool '{tool_name}'"
+            return f"MCP 错误: 未知工具 '{tool_name}'"
         try:
             return handler(**args)
         except Exception as e:
-            return f"MCP error: {e}"
+            return f"MCP 错误: {e}"
 
 
 mcp_clients: dict[str, MCPClient] = {}
@@ -686,7 +687,7 @@ _DISALLOWED_CHARS = re.compile(r'[^a-zA-Z0-9_-]')
 
 
 def normalize_mcp_name(name: str) -> str:
-    """Replace non [a-zA-Z0-9_-] with underscore."""
+    """将非 [a-zA-Z0-9_-] 的字符替换为下划线，保持工具名称的纯粹。"""
     return _DISALLOWED_CHARS.sub('_', name)
 
 
@@ -694,16 +695,16 @@ def _mock_server_docs():
     client = MCPClient("docs")
     client.register(
         tool_defs=[
-            {"name": "search", "description": "Search documentation. (readOnly)",
+            {"name": "search", "description": "搜索文档。 (readOnly)",
              "inputSchema": {"type": "object",
                              "properties": {"query": {"type": "string"}},
                              "required": ["query"]}},
-            {"name": "get_version", "description": "Get API version. (readOnly)",
+            {"name": "get_version", "description": "获取 API 版本。 (readOnly)",
              "inputSchema": {"type": "object", "properties": {},
                              "required": []}},
         ],
         handlers={
-            "search": lambda query: f"[docs] Found 3 results for '{query}'",
+            "search": lambda query: f"[docs] 找到了 3 个关于 '{query}' 的结果",
             "get_version": lambda: "[docs] API v2.1.0",
         })
     return client
@@ -714,18 +715,18 @@ def _mock_server_deploy():
     client.register(
         tool_defs=[
             {"name": "trigger",
-             "description": "Trigger a deployment. (destructive — requires approval in real CC)",
+             "description": "触发部署。 (destructive — 在真实的 CC 中需要审批)",
              "inputSchema": {"type": "object",
                              "properties": {"service": {"type": "string"}},
                              "required": ["service"]}},
-            {"name": "status", "description": "Check deployment status. (readOnly)",
+            {"name": "status", "description": "检查部署状态。 (readOnly)",
              "inputSchema": {"type": "object",
                              "properties": {"service": {"type": "string"}},
                              "required": ["service"]}},
         ],
         handlers={
-            "trigger": lambda service: f"[deploy] Triggered: {service}",
-            "status": lambda service: f"[deploy] {service}: running (v1.4.2)",
+            "trigger": lambda service: f"[deploy] 已触发: {service}",
+            "status": lambda service: f"[deploy] {service}: 运行中 (v1.4.2)",
         })
     return client
 
@@ -738,21 +739,21 @@ MOCK_SERVERS = {
 
 def connect_mcp(name: str) -> str:
     if name in mcp_clients:
-        return f"MCP server '{name}' already connected"
+        return f"MCP 服务器 '{name}' 已经连接了"
     factory = MOCK_SERVERS.get(name)
     if not factory:
         available = ", ".join(MOCK_SERVERS.keys())
-        return f"Unknown server '{name}'. Available: {available}"
+        return f"未知的服务器 '{name}'。目前可用: {available}"
     mcp_client = factory()
     mcp_clients[name] = mcp_client
     tool_names = [t["name"] for t in mcp_client.tools]
-    print(f"  \033[31m[mcp] connected: {name} → {tool_names}\033[0m")
-    return (f"Connected to MCP server '{name}'. "
-            f"Discovered {len(mcp_client.tools)} tools: {', '.join(tool_names)}")
+    print(f"  \033[31m[mcp] 已连接: {name} → {tool_names}\033[0m")
+    return (f"已连接到 MCP 服务器 '{name}'。 "
+            f"发现了 {len(mcp_client.tools)} 个工具: {', '.join(tool_names)}")
 
 
 def assemble_tool_pool() -> tuple[list[dict], dict]:
-    """Assemble builtin tools + all MCP tools into one pool."""
+    """将内置工具与所有 MCP 工具完美组装成一个巨大的工具池。"""
     tools = list(BUILTIN_TOOLS)
     handlers = dict(BUILTIN_HANDLERS)
     for server_name, mcp_client in mcp_clients.items():
@@ -770,7 +771,7 @@ def assemble_tool_pool() -> tuple[list[dict], dict]:
     return tools, handlers
 
 
-# ── Lead Worktree Tools ──
+# ── Lead 工作树工具 ──
 
 def run_create_worktree(name: str, task_id: str = "") -> str:
     return create_worktree(name, task_id)
@@ -782,46 +783,55 @@ def run_keep_worktree(name: str) -> str:
     return keep_worktree(name)
 
 
-# ── Basic tool handlers ──
+# ── 基础工具处理器 ──
 
 def run_create_task(subject: str, description: str = "",
                     blockedBy: list[str] | None = None) -> str:
     task = create_task(subject, description, blockedBy)
-    deps = f" (blockedBy: {', '.join(blockedBy)})" if blockedBy else ""
-    print(f"  \033[34m[create] {task.subject}{deps}\033[0m")
-    return f"Created {task.id}: {task.subject}{deps}"
+    deps = f" (被阻塞: {', '.join(blockedBy)})" if blockedBy else ""
+    print(f"  \033[34m[创建] {task.subject}{deps}\033[0m")
+    return f"已创建 {task.id}: {task.subject}{deps}"
 
 
 def run_list_tasks() -> str:
     tasks = list_tasks()
     if not tasks:
-        return "No tasks."
+        return "没有任务哦。"
     return "\n".join(
         f"  {t.id}: {t.subject} [{t.status}]"
-        + (f" (wt:{t.worktree})" if t.worktree else "")
+        + (f" (工作树:{t.worktree})" if t.worktree else "")
         for t in tasks)
 
 
 def run_get_task(task_id: str) -> str:
-    return get_task_json(task_id)
+    try:
+        return get_task_json(task_id)
+    except FileNotFoundError:
+        return f"错误: 找不到任务 {task_id}"
 
 def run_claim_task(task_id: str) -> str:
-    return claim_task(task_id, owner="agent")
+    try:
+        return claim_task(task_id, owner="agent")
+    except FileNotFoundError:
+        return f"错误: 找不到任务 {task_id}"
 
 def run_complete_task(task_id: str) -> str:
-    return complete_task(task_id)
+    try:
+        return complete_task(task_id)
+    except FileNotFoundError:
+        return f"错误: 找不到任务 {task_id}"
 
 def run_spawn_teammate(name: str, role: str, prompt: str) -> str:
     return spawn_teammate_thread(name, role, prompt)
 
 def run_send_message(to: str, content: str) -> str:
     BUS.send("lead", to, content)
-    return f"Sent to {to}"
+    return f"已发送给 {to}"
 
 def run_check_inbox() -> str:
     msgs = consume_lead_inbox(route_protocol=True)
     if not msgs:
-        return "(inbox empty)"
+        return "(邮箱空空如也)"
     lines = []
     for m in msgs:
         meta = m.get("metadata", {})
@@ -834,95 +844,95 @@ def run_connect_mcp(name: str) -> str:
     return connect_mcp(name)
 
 
-# ── Tool Definitions ──
+# ── 工具定义 ──
 
 BUILTIN_TOOLS = [
-    {"name": "bash", "description": "Run a shell command.",
+    {"name": "bash", "description": "执行 shell 命令。",
      "input_schema": {"type": "object",
                       "properties": {"command": {"type": "string"}},
                       "required": ["command"]}},
-    {"name": "read_file", "description": "Read file contents.",
+    {"name": "read_file", "description": "读取文件内容。",
      "input_schema": {"type": "object",
                       "properties": {"path": {"type": "string"},
                                      "limit": {"type": "integer"}},
                       "required": ["path"]}},
-    {"name": "write_file", "description": "Write content to a file.",
+    {"name": "write_file", "description": "向文件写入内容。",
      "input_schema": {"type": "object",
                       "properties": {"path": {"type": "string"},
                                      "content": {"type": "string"}},
                       "required": ["path", "content"]}},
-    {"name": "create_task", "description": "Create a task.",
+    {"name": "create_task", "description": "创建一个任务。",
      "input_schema": {"type": "object",
                       "properties": {"subject": {"type": "string"},
                                      "description": {"type": "string"},
                                      "blockedBy": {"type": "array",
                                                    "items": {"type": "string"}}},
                       "required": ["subject"]}},
-    {"name": "list_tasks", "description": "List all tasks.",
+    {"name": "list_tasks", "description": "列出所有任务。",
      "input_schema": {"type": "object", "properties": {}, "required": []}},
-    {"name": "get_task", "description": "Get full task details.",
+    {"name": "get_task", "description": "获取完整的任务细节。",
      "input_schema": {"type": "object",
                       "properties": {"task_id": {"type": "string"}},
                       "required": ["task_id"]}},
-    {"name": "claim_task", "description": "Claim a pending task.",
+    {"name": "claim_task", "description": "认领一个待处理任务。",
      "input_schema": {"type": "object",
                       "properties": {"task_id": {"type": "string"}},
                       "required": ["task_id"]}},
-    {"name": "complete_task", "description": "Complete an in-progress task.",
+    {"name": "complete_task", "description": "完成一个进行中的任务。",
      "input_schema": {"type": "object",
                       "properties": {"task_id": {"type": "string"}},
                       "required": ["task_id"]}},
-    {"name": "spawn_teammate", "description": "Spawn an autonomous teammate.",
+    {"name": "spawn_teammate", "description": "孵化一个自主的队友智能体。",
      "input_schema": {"type": "object",
                       "properties": {"name": {"type": "string"},
                                      "role": {"type": "string"},
                                      "prompt": {"type": "string"}},
                       "required": ["name", "role", "prompt"]}},
-    {"name": "send_message", "description": "Send message to a teammate.",
+    {"name": "send_message", "description": "向队友发送消息。",
      "input_schema": {"type": "object",
                       "properties": {"to": {"type": "string"},
                                      "content": {"type": "string"}},
                       "required": ["to", "content"]}},
     {"name": "check_inbox",
-     "description": "Check inbox for messages and protocol responses.",
+     "description": "检查邮箱里的消息和协议响应。",
      "input_schema": {"type": "object", "properties": {}, "required": []}},
     {"name": "request_shutdown",
-     "description": "Request a teammate to shut down.",
+     "description": "请求队友停机。",
      "input_schema": {"type": "object",
                       "properties": {"teammate": {"type": "string"}},
                       "required": ["teammate"]}},
     {"name": "request_plan",
-     "description": "Ask a teammate to submit a plan.",
+     "description": "要求队友提交计划。",
      "input_schema": {"type": "object",
                       "properties": {"teammate": {"type": "string"},
                                      "task": {"type": "string"}},
                       "required": ["teammate", "task"]}},
     {"name": "review_plan",
-     "description": "Approve or reject a submitted plan.",
+     "description": "批准或驳回提交的计划。",
      "input_schema": {"type": "object",
                       "properties": {"request_id": {"type": "string"},
                                      "approve": {"type": "boolean"},
                                      "feedback": {"type": "string"}},
                       "required": ["request_id", "approve"]}},
     {"name": "create_worktree",
-     "description": "Create an isolated git worktree.",
+     "description": "创建一个隔离的 git 工作树。",
      "input_schema": {"type": "object",
                       "properties": {"name": {"type": "string"},
                                      "task_id": {"type": "string"}},
                       "required": ["name"]}},
     {"name": "remove_worktree",
-     "description": "Remove a worktree. Refuses if changes exist.",
+     "description": "移除工作树。如果有未提交的更改会拒绝执行。",
      "input_schema": {"type": "object",
                       "properties": {"name": {"type": "string"},
                                      "discard_changes": {"type": "boolean"}},
                       "required": ["name"]}},
     {"name": "keep_worktree",
-     "description": "Keep a worktree for manual review.",
+     "description": "保留工作树以供人工审查。",
      "input_schema": {"type": "object",
                       "properties": {"name": {"type": "string"}},
                       "required": ["name"]}},
     {"name": "connect_mcp",
-     "description": "Connect to an MCP server (docs, deploy) and discover tools.",
+     "description": "连接到 MCP 服务器 (如 docs, deploy) 并探索上面的工具。",
      "input_schema": {"type": "object",
                       "properties": {"name": {"type": "string"}},
                       "required": ["name"]}},
@@ -944,7 +954,7 @@ BUILTIN_HANDLERS = {
 }
 
 
-# ── Context ──
+# ── 上下文 ──
 
 MEMORY_DIR = WORKDIR / ".memory"
 MEMORY_INDEX = MEMORY_DIR / "MEMORY.md"
@@ -957,7 +967,7 @@ def update_context(context: dict, messages: list) -> dict:
     return {"memories": memories}
 
 
-# ── Agent Loop (s19: dynamic tool pool, no prompt cache) ──
+# ── 智能体主循环 (s19: 动态工具池，不再使用固定的提示词缓存) ──
 
 def agent_loop(messages: list, context: dict):
     tools, handlers = assemble_tool_pool()
@@ -982,7 +992,7 @@ def agent_loop(messages: list, context: dict):
                 continue
             print(f"\033[36m> {block.name}\033[0m")
             handler = handlers.get(block.name)
-            output = handler(**block.input) if handler else "Unknown"
+            output = handler(**block.input) if handler else "未知的工具"
             print(str(output)[:300])
             results.append({"type": "tool_result",
                             "tool_use_id": block.id, "content": output})
@@ -996,29 +1006,4 @@ def agent_loop(messages: list, context: dict):
 
 
 if __name__ == "__main__":
-    print("s19: mcp tools")
-    print("Enter a question, press Enter to send. Type q to quit.\n")
-    history = []
-    context = {"memories": ""}
-    while True:
-        try:
-            query = input("\033[36ms19 >> \033[0m")
-        except (EOFError, KeyboardInterrupt):
-            break
-        if query.strip().lower() in ("q", "exit", ""):
-            break
-        history.append({"role": "user", "content": query})
-        agent_loop(history, context)
-        context = update_context(context, history)
-        for block in history[-1]["content"]:
-            if getattr(block, "type", None) == "text":
-                print(block.text)
-
-        inbox = consume_lead_inbox(route_protocol=True)
-        if inbox:
-            inbox_text = "\n".join(
-                f"From {m['from']} [{m.get('type', 'message')}]: "
-                f"{m['content'][:200]}" for m in inbox)
-            history.append({"role": "user",
-                            "content": f"[Inbox]\n{inbox_text}"})
-        print()
+    print("s19: MCP 插件 (MCP Tools)")

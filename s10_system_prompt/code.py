@@ -1,21 +1,22 @@
 #!/usr/bin/env python3
 """
-s10: System Prompt — Runtime prompt assembly with caching.
+s10: 动态系统提示词 (System Prompt) — 带有缓存机制的运行时提示词组装。
 
-Run:  python s10_system_prompt/code.py
-Need: pip install anthropic python-dotenv + .env with ANTHROPIC_API_KEY
+运行: python s10_system_prompt/code.py
+依赖: pip install anthropic python-dotenv + .env 文件中配置 ANTHROPIC_API_KEY
 
-Changes from s09:
-  - PROMPT_SECTIONS: topic-keyed dict of prompt fragments
-  - assemble_system_prompt(context): select + join sections by real state
-  - get_system_prompt(context): deterministic cache via json.dumps
-  - agent_loop uses get_system_prompt(context) instead of hardcoded SYSTEM
+相比 s09 的变更:
+  - PROMPT_SECTIONS: 采用基于主题的提示词片段字典来维护内容
+  - assemble_system_prompt(context): 基于真实的运行状态进行提示词组装
+  - get_system_prompt(context): 利用 json.dumps 提供稳定的缓存，避免冗余组装
+  - agent_loop 中使用 get_system_prompt(context) 代替硬编码的 SYSTEM 变量
 
-Memory section loads when .memory/MEMORY.md exists (real state, not keywords).
+记忆功能只有在 .memory/MEMORY.md 文件切实存在时才加载 (基于真实状态而非写死的关键字)。
 """
 
 import os, subprocess, json
 from pathlib import Path
+from typing import Optional
 
 try:
     import readline
@@ -34,10 +35,10 @@ WORKDIR = Path.cwd()
 MEMORY_DIR = WORKDIR / ".memory"
 MEMORY_INDEX = MEMORY_DIR / "MEMORY.md"
 client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
-MODEL = os.environ["MODEL_ID"]
+MODEL = os.getenv("MODEL_ID", "deepseek-v4-pro")
 
 
-# ── Prompt Sections ──
+# ── 提示词分段定义 ──
 
 PROMPT_SECTIONS = {
     "identity": "You are a coding agent. Act, don't explain.",
@@ -48,15 +49,15 @@ PROMPT_SECTIONS = {
 
 
 def assemble_system_prompt(context: dict) -> str:
-    """Select and join prompt sections based on current context."""
+    """基于当前的运行上下文，选择性拼接所需的提示词片段。"""
     sections = []
 
-    # Always loaded — identity, tools, workspace
+    # 始终加载的部分 — 身份、工具、工作目录
     sections.append(PROMPT_SECTIONS["identity"])
     sections.append(PROMPT_SECTIONS["tools"])
     sections.append(PROMPT_SECTIONS["workspace"])
 
-    # Conditional — memory loaded when MEMORY.md exists and has content
+    # 条件加载部分 — 仅当 MEMORY.md 存在且有内容时才注入记忆配置
     memories = context.get("memories", "")
     if memories:
         sections.append(f"Relevant memories:\n{memories}")
@@ -64,24 +65,27 @@ def assemble_system_prompt(context: dict) -> str:
     return "\n\n".join(sections)
 
 
+# 用于缓存的状态变量
 _last_context_key = None
 _last_prompt = None
 
 
 def get_system_prompt(context: dict) -> str:
-    """Cache wrapper — reassemble only when context changes.
+    """带缓存机制的获取系统提示词的封装 — 仅当 context 改变时才重新组装。
 
-    Uses json.dumps for deterministic serialization, not Python's hash()
-    which has process randomization and fails on nested dicts/lists.
-    This cache only avoids redundant string assembly within a process.
-    Real Claude Code additionally protects API-level prompt cache via
-    stable section ordering and SYSTEM_PROMPT_DYNAMIC_BOUNDARY.
+    使用 json.dumps 获得确定性的序列化结果，不用 Python 原生的 hash()
+    (因为 hash 存在进程级随机性且不支持嵌套字典/列表)。
+    此处的缓存避免了同一进程内多余的字符串拼接操作。
+    (在真实的 Claude Code 实现中，还会利用固定顺序 + SYSTEM_PROMPT_DYNAMIC_BOUNDARY 来保护 API 层面的 Prompt Caching)。
     """
     global _last_context_key, _last_prompt
     key = json.dumps(context, sort_keys=True, ensure_ascii=False, default=str)
+    
+    # 缓存命中，直接返回
     if key == _last_context_key and _last_prompt:
         print("  \033[90m[cache hit] system prompt unchanged\033[0m")
         return _last_prompt
+        
     _last_context_key = key
     _last_prompt = assemble_system_prompt(context)
 
@@ -92,9 +96,10 @@ def get_system_prompt(context: dict) -> str:
     return _last_prompt
 
 
-# ── Tools ──
+# ── 工具定义 ──
 
 def safe_path(p: str) -> Path:
+    """路径安全检查"""
     path = (WORKDIR / p).resolve()
     if not path.is_relative_to(WORKDIR):
         raise ValueError(f"Path escapes workspace: {p}")
@@ -111,7 +116,7 @@ def run_bash(command: str) -> str:
         return "Error: Timeout (120s)"
 
 
-def run_read(path: str, limit: int | None = None) -> str:
+def run_read(path: str, limit: Optional[int] = None) -> str:
     try:
         lines = safe_path(path).read_text().splitlines()
         if limit and limit < len(lines):
@@ -151,10 +156,10 @@ TOOLS = [
 TOOL_HANDLERS = {"bash": run_bash, "read_file": run_read, "write_file": run_write}
 
 
-# ── Context ──
+# ── 上下文收集 ──
 
 def update_context(context: dict, messages: list) -> dict:
-    """Derive context from real state: which tools exist, whether memory files exist."""
+    """从真实的运行状态提取上下文: 当前开启的工具、是否能读取到记忆索引等。"""
     memories = ""
     if MEMORY_INDEX.exists():
         content = MEMORY_INDEX.read_text().strip()
@@ -167,16 +172,17 @@ def update_context(context: dict, messages: list) -> dict:
     }
 
 
-# ── Agent Loop ──
+# ── 主代理循环 ──
 
 def agent_loop(messages: list, context: dict):
-    """Main loop — uses assembled system prompt instead of hardcoded SYSTEM."""
+    """主循环 — 使用动态组装的系统提示词，替代全局的硬编码 SYSTEM。"""
     system = get_system_prompt(context)
     while True:
         response = client.messages.create(
             model=MODEL, system=system, messages=messages,
             tools=TOOLS, max_tokens=8000)
         messages.append({"role": "assistant", "content": response.content})
+        
         if response.stop_reason != "tool_use":
             return
 
@@ -192,14 +198,14 @@ def agent_loop(messages: list, context: dict):
                             "tool_use_id": block.id, "content": output})
         messages.append({"role": "user", "content": results})
 
-        # Re-evaluate context and prompt after each tool round
+        # 每次工具调用结束，重新评估环境状态并更新上下文和系统提示词
         context = update_context(context, messages)
         system = get_system_prompt(context)
 
 
 if __name__ == "__main__":
-    print("s10: system prompt — runtime assembly")
-    print("Enter a question, press Enter to send. Type q to quit.\n")
+    print("s10: 动态提示词 (system prompt) — 运行时按需组装")
+    print("输入问题，按回车发送。输入 q 退出。\n")
     history = []
     context = update_context({}, [])
     while True:

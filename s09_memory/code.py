@@ -1,31 +1,31 @@
 #!/usr/bin/env python3
 """
-s09_memory.py - Memory System
+s09: 记忆系统 (Memory System)
 
-Persistent, cross-session knowledge for the coding agent.
+为编码代理提供持久化、跨会话的知识。
 
-Storage:
+存储结构:
     .memory/
-      MEMORY.md          ← index (one line per memory, ≤200 lines)
-      feedback_tabs.md    ← individual memory files (Markdown + YAML frontmatter)
+      MEMORY.md          ← 索引文件 (每行一条记忆，最多 200 行)
+      feedback_tabs.md    ← 独立的记忆文件 (Markdown 格式 + YAML 前置数据)
       user_profile.md
       project_facts.md
 
-Flow in agent_loop:
-    1. Load MEMORY.md index into SYSTEM prompt (cheap, always present)
-    2. Select relevant memories by filename/description → inject content
-    3. Run compression pipeline from s08
-    4. After each turn ends → extract new memories from original messages
-    5. Periodically consolidate (Dream)
+在 agent_loop 中的数据流:
+    1. 将 MEMORY.md 索引加载到 SYSTEM 提示词中 (成本极低，常驻)
+    2. 根据最近的对话通过 文件名/描述 筛选相关的记忆 → 注入正文到上下文
+    3. 执行 s08 的压缩管道
+    4. 每轮结束后 → 从最原始的对话中提取新的记忆
+    5. 定期合并记忆以防膨胀 (Dream 机制)
 
-Builds on s08 (context compact). Usage:
-
-    python s09_memory/code.py
-    Needs: pip install anthropic python-dotenv + ANTHROPIC_API_KEY in .env
+基于 s08 (上下文压缩) 构建。
+运行: python s09_memory/code.py
+依赖: pip install anthropic python-dotenv + .env 文件中配置 ANTHROPIC_API_KEY
 """
 
 import os, subprocess, json, time, re
 from pathlib import Path
+from typing import Optional
 
 try:
     import readline
@@ -46,16 +46,17 @@ SKILLS_DIR = WORKDIR / "skills"
 TRANSCRIPT_DIR = WORKDIR / ".transcripts"
 TOOL_RESULTS_DIR = WORKDIR / ".task_outputs" / "tool-results"
 client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
-MODEL = os.environ["MODEL_ID"]
+MODEL = os.getenv("MODEL_ID", "deepseek-v4-pro")
 
 
 # ═══════════════════════════════════════════════════════════
-#  NEW in s09: Memory System
+#  s09 新增: 记忆系统
 # ═══════════════════════════════════════════════════════════
 
 MEMORY_TYPES = ["user", "feedback", "project", "reference"]
 
 def _parse_frontmatter(text: str) -> tuple[dict, str]:
+    """解析记忆文件的 YAML frontmatter 数据"""
     if not text.startswith("---"):
         return {}, text
     parts = text.split("---", 2)
@@ -70,7 +71,7 @@ def _parse_frontmatter(text: str) -> tuple[dict, str]:
 
 
 def write_memory_file(name: str, mem_type: str, description: str, body: str):
-    """Write a single memory file with YAML frontmatter."""
+    """写入单个记忆文件并更新索引"""
     slug = name.lower().replace(" ", "-").replace("/", "-")
     filename = f"{slug}.md"
     filepath = MEMORY_DIR / filename
@@ -82,7 +83,7 @@ def write_memory_file(name: str, mem_type: str, description: str, body: str):
 
 
 def _rebuild_index():
-    """Rebuild MEMORY.md index from all memory files."""
+    """遍历所有的记忆文件重建 MEMORY.md 索引文件"""
     lines = []
     for f in sorted(MEMORY_DIR.glob("*.md")):
         if f.name == "MEMORY.md":
@@ -96,15 +97,15 @@ def _rebuild_index():
 
 
 def read_memory_index() -> str:
-    """Read MEMORY.md index (injected into SYSTEM every turn)."""
+    """读取记忆索引文件，每轮被注入到 SYSTEM 提示词中"""
     if not MEMORY_INDEX.exists():
         return ""
     text = MEMORY_INDEX.read_text().strip()
     return text if text else ""
 
 
-def read_memory_file(filename: str) -> str | None:
-    """Read a single memory file's full content."""
+def read_memory_file(filename: str) -> Optional[str]:
+    """读取指定的完整记忆文件内容"""
     path = MEMORY_DIR / filename
     if not path.exists():
         return None
@@ -112,7 +113,7 @@ def read_memory_file(filename: str) -> str | None:
 
 
 def list_memory_files() -> list[dict]:
-    """List all memory files with metadata."""
+    """列出当前所有的记忆文件及其元数据"""
     result = []
     for f in sorted(MEMORY_DIR.glob("*.md")):
         if f.name == "MEMORY.md":
@@ -130,14 +131,13 @@ def list_memory_files() -> list[dict]:
 
 
 def select_relevant_memories(messages: list, max_items: int = 5) -> list[str]:
-    """Select relevant memory filenames by matching recent conversation against
-    memory names/descriptions. Uses a simple LLM call (or falls back to keyword
-    matching on name+description)."""
+    """通过对比近期对话和记忆标题/描述来选择最相关的记忆进行深度加载。
+    优先调用 LLM 选择，失败则退级使用关键词匹配。"""
     files = list_memory_files()
     if not files:
         return []
 
-    # Collect recent user text for context
+    # 提取最近的用户交互对话，用作匹配的上下文
     recent_texts = []
     for msg in reversed(messages):
         if msg.get("role") == "user":
@@ -156,7 +156,7 @@ def select_relevant_memories(messages: list, max_items: int = 5) -> list[str]:
     if not recent.strip():
         return []
 
-    # Build catalog of name + description for LLM to choose from
+    # 构建供 LLM 挑选的备选清单
     catalog_lines = []
     for i, f in enumerate(files):
         catalog_lines.append(f"{i}: {f['name']} — {f['description']}")
@@ -178,7 +178,6 @@ def select_relevant_memories(messages: list, max_items: int = 5) -> list[str]:
             max_tokens=200,
         )
         text = extract_text(response.content).strip()
-        # Extract JSON array from response
         match = re.search(r'\[.*?\]', text, re.DOTALL)
         if match:
             indices = json.loads(match.group())
@@ -192,7 +191,7 @@ def select_relevant_memories(messages: list, max_items: int = 5) -> list[str]:
     except Exception:
         pass
 
-    # Fallback: keyword matching on name + description
+    # 退级方案：简单的关键词匹配
     keywords = [w.lower() for w in recent.split() if len(w) > 3]
     selected = []
     for f in files:
@@ -205,7 +204,7 @@ def select_relevant_memories(messages: list, max_items: int = 5) -> list[str]:
 
 
 def load_memories(messages: list) -> str:
-    """Load relevant memory content for injection into context."""
+    """加载相关记忆的正文，用以注入当前会话上下文"""
     selected_files = select_relevant_memories(messages)
     if not selected_files:
         return ""
@@ -220,8 +219,7 @@ def load_memories(messages: list) -> str:
 
 
 def extract_memories(messages: list):
-    """Extract new memories from recent dialogue. Runs after each turn."""
-    # Collect recent conversation text
+    """从近期对话中提取有价值的信息沉淀为记忆，每次会话结束后触发。"""
     dialogue_parts = []
     for msg in messages[-10:]:
         role = msg.get("role", "?")
@@ -238,7 +236,7 @@ def extract_memories(messages: list):
     if not dialogue.strip():
         return
 
-    # Check existing memories to avoid duplicates
+    # 附带当前已有的记忆防止重复提取
     existing = list_memory_files()
     existing_desc = "\n".join(f"- {m['name']}: {m['description']}" for m in existing) if existing else "(none)"
 
@@ -260,7 +258,6 @@ def extract_memories(messages: list):
             model=MODEL, messages=[{"role": "user", "content": prompt}], max_tokens=800
         )
         text = extract_text(response.content).strip()
-        # Extract JSON array from response
         match = re.search(r'\[.*\]', text, re.DOTALL)
         if not match:
             return
@@ -277,7 +274,7 @@ def extract_memories(messages: list):
                 write_memory_file(name, mem_type, desc, body)
                 count += 1
         if count:
-            print(f"\n\033[33m[Memory: extracted {count} new memories]\033[0m")
+            print(f"\n\033[33m[Memory: 提取了 {count} 条新记忆]\033[0m")
     except Exception:
         pass
 
@@ -285,7 +282,7 @@ def extract_memories(messages: list):
 CONSOLIDATE_THRESHOLD = 10
 
 def consolidate_memories():
-    """Merge duplicate/stale memories. Triggered when file count ≥ threshold."""
+    """定期合并重复/过期的记忆，防止记忆文件数量过度膨胀。"""
     files = list_memory_files()
     if len(files) < CONSOLIDATE_THRESHOLD:
         return
@@ -315,11 +312,12 @@ def consolidate_memories():
             return
         items = json.loads(match.group())
 
-        # Remove old memory files (keep MEMORY.md)
+        # 清除所有的旧记忆
         for f in MEMORY_DIR.glob("*.md"):
             if f.name != "MEMORY.md":
                 f.unlink()
 
+        # 重新写入合并后的记忆
         for mem in items:
             name = mem.get("name", f"memory_{int(time.time())}")
             mem_type = mem.get("type", "user")
@@ -328,13 +326,13 @@ def consolidate_memories():
             if desc and body:
                 write_memory_file(name, mem_type, desc, body)
 
-        print(f"\n\033[33m[Memory: consolidated {len(files)} → {len(items)} memories]\033[0m")
+        print(f"\n\033[33m[Memory: 已合并 {len(files)} 条为 {len(items)} 条记忆]\033[0m")
     except Exception:
         pass
 
 
-# Build SYSTEM with memory index
 def build_system() -> str:
+    """带有记忆索引信息的系统提示词构建"""
     index = read_memory_index()
     memories_section = f"\n\nMemories available:\n{index}" if index else ""
     return (
@@ -354,7 +352,7 @@ SUB_SYSTEM = (
 
 
 # ═══════════════════════════════════════════════════════════
-#  FROM s02-s08 (skeleton): Basic tools
+#  来自 s02-s08 (骨架代码): 基础工具
 # ═══════════════════════════════════════════════════════════
 
 def safe_path(p: str) -> Path:
@@ -369,7 +367,7 @@ def run_bash(command: str) -> str:
         return out[:50000] if out else "(no output)"
     except subprocess.TimeoutExpired: return "Error: Timeout (120s)"
 
-def run_read(path: str, limit: int | None = None) -> str:
+def run_read(path: str, limit: Optional[int] = None) -> str:
     try:
         lines = safe_path(path).read_text().splitlines()
         if limit and limit < len(lines): lines = lines[:limit] + [f"... ({len(lines) - limit} more lines)"]
@@ -405,7 +403,7 @@ def extract_text(content) -> str:
     if not isinstance(content, list): return str(content)
     return "\n".join(getattr(b, "text", "") for b in content if getattr(b, "type", None) == "text")
 
-# Subagent (simplified from s06-s07)
+# 子代理
 SUB_TOOLS = [
     {"name": "bash", "description": "Run a shell command.",
      "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
@@ -444,7 +442,7 @@ def spawn_subagent(task: str) -> str:
 
 
 # ═══════════════════════════════════════════════════════════
-#  FROM s08 (skeleton): Compaction pipeline
+#  来自 s08 (骨架代码): 上下文压缩机制
 # ═══════════════════════════════════════════════════════════
 
 CONTEXT_LIMIT = 50000; KEEP_RECENT = 3; PERSIST_THRESHOLD = 30000
@@ -518,7 +516,7 @@ def reactive_compact(msgs):
 
 
 # ═══════════════════════════════════════════════════════════
-#  Tool Definitions (skeleton — fewer tools to focus on memory)
+#  基础工具注册
 # ═══════════════════════════════════════════════════════════
 
 TOOLS = [
@@ -543,25 +541,27 @@ TOOL_HANDLERS = {
 
 
 # ═══════════════════════════════════════════════════════════
-#  agent_loop — s09: inject memories + extract after each turn
+#  agent_loop — s09: 注入记忆并在结束后提取新记忆
 # ═══════════════════════════════════════════════════════════
 
 MAX_REACTIVE_RETRIES = 1
 
 def agent_loop(messages: list):
+    """核心 AI 代理循环，集成记忆加载和沉淀"""
     reactive_retries = 0
-    # s09: inject relevant memory content into the current user turn
+    # s09: 加载相关记忆正文到当前交互轮次中
     memories_content = load_memories(messages)
     memory_turn = len(messages) - 1 if messages and isinstance(messages[-1].get("content"), str) else None
+    
     while True:
-        # s09: rebuild system with current memory index
+        # s09: 基于当前最新的记忆索引重建系统提示词
         system = build_system()
 
-        # s09: save pre-compression snapshot for accurate memory extraction
+        # s09: 备份未压缩的消息记录，保障提取记忆时的保真度
         pre_compress = [m if isinstance(m, dict) else {"role": m.get("role",""),
             "content": str(m.get("content",""))} for m in messages]
 
-        # s08: compression pipeline (budget → snip → micro)
+        # s08: 压缩管道
         messages[:] = tool_result_budget(messages)
         messages[:] = snip_compact(messages)
         messages[:] = micro_compact(messages)
@@ -572,6 +572,7 @@ def agent_loop(messages: list):
 
         try:
             request_messages = messages
+            # 如果有相关记忆，将记忆文本附加在最后一条用户消息中
             if memories_content and memory_turn is not None and memory_turn < len(messages):
                 request_messages = messages.copy()
                 request_messages[memory_turn] = {
@@ -591,8 +592,10 @@ def agent_loop(messages: list):
             raise
 
         messages.append({"role": "assistant", "content": response.content})
+        
+        # 退出循环前
         if response.stop_reason != "tool_use":
-            # s09: extract from pre-compression snapshot for full fidelity
+            # s09: 使用未压缩的历史快照进行精准记忆提取，并合并冗余记忆
             extract_memories(pre_compress)
             consolidate_memories()
             return
@@ -609,7 +612,7 @@ def agent_loop(messages: list):
 
 
 if __name__ == "__main__":
-    print("s09: Memory — persistent cross-session knowledge")
+    print("s09: 记忆系统 (Memory) — 跨会话的持久化知识累积")
     print("输入问题，回车发送。输入 q 退出。\n")
     history = []
     while True:

@@ -1,6 +1,5 @@
 # s13: Background Tasks — 慢操作放后台
 
-[中文](README.md) · [English](README.en.md) · [日本語](README.ja.md)
 
 s01 → ... → s11 → s12 → `s13` → [s14](../s14_cron_scheduler/) → s15 → ... → s20
 

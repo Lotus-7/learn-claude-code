@@ -1,6 +1,5 @@
 # s20: Comprehensive Agent — 全部机制，归到一个循环
 
-[中文](README.md) · [English](README.en.md) · [日本語](README.ja.md)
 
 s01 → ... → s18 → s19 → `s20`
 

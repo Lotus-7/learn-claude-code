@@ -1,27 +1,28 @@
 #!/usr/bin/env python3
 """
-s15: Agent Teams — MessageBus + spawn_teammate_thread + inbox injection.
+s15: 多智能体团队 (Agent Teams) — 消息总线 + 线程化队友 + 收件箱注入。
 
-Run:  python s15_agent_teams/code.py
-Need: pip install anthropic python-dotenv + .env with ANTHROPIC_API_KEY
+运行: python s15_agent_teams/code.py
+前置要求: pip install anthropic python-dotenv 并在 .env 中配置 ANTHROPIC_API_KEY
 
-Changes from s14:
-  - MessageBus class: file-based mailboxes (.mailboxes/*.jsonl)
-  - spawn_teammate_thread: creates teammate in background thread
-  - Teammate runs own simplified agent_loop (bash, read, write, send_message)
-  - Lead tools: spawn_teammate, send_message, check_inbox (3 new)
-  - Lead inbox: teammate messages injected into history (not just printed)
-  - Teaching version: teammates limited to 10 rounds (real CC uses idle loop)
+相比 s14 的核心变动:
+  - MessageBus (消息总线) 类: 基于文件的邮箱机制 (.mailboxes/*.jsonl)
+  - spawn_teammate_thread: 在后台线程中孵化（创建）队友 Agent
+  - Teammate (队友) 运行着属于自己的精简版 agent_loop (仅包含 bash, read, write, send_message)
+  - 主节点 (Lead) 新增工具: spawn_teammate, send_message, check_inbox
+  - 主节点收件箱: 队友发来的消息会被注入到历史上下文中 (不仅仅是打印)
+  - 教学限制: 为了防止死循环，队友最多运行 10 轮交互 (真正的 Claude Code 会使用 idle loop)
 
-ASCII flow:
-  Lead: cron_queue → messages → prompt → LLM → TOOLS ────→ loop
-                ↑                     ↓                        |
-                └── inbox ← MessageBus ← teammate.send_message ←┘
-  Teammate: inbox → LLM → bash/read/write/send → loop (max 10 turns)
+交互流示意:
+  主节点: cron_queue → messages → prompt → LLM → TOOLS ────→ loop
+                  ↑                     ↓                        |
+                  └── inbox ← MessageBus ← teammate.send_message ←┘
+  队友: inbox → LLM → bash/read/write/send → loop (最多 10 轮)
 """
 
 import os, subprocess, json, time, random, threading
 from pathlib import Path
+from typing import Optional
 from datetime import datetime
 from dataclasses import dataclass, asdict
 
@@ -42,9 +43,9 @@ WORKDIR = Path.cwd()
 MEMORY_DIR = WORKDIR / ".memory"
 MEMORY_INDEX = MEMORY_DIR / "MEMORY.md"
 client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
-MODEL = os.environ["MODEL_ID"]
+MODEL = os.getenv("MODEL_ID", "deepseek-v4-pro")
 
-# ── Task System (from s12, synced) ──
+# ── 任务系统 (同步自 s12) ──
 
 TASKS_DIR = WORKDIR / ".tasks"
 TASKS_DIR.mkdir(exist_ok=True)
@@ -56,7 +57,7 @@ class Task:
     subject: str
     description: str
     status: str          # pending | in_progress | completed
-    owner: str | None
+    owner: Optional[str]
     blockedBy: list[str]
 
 
@@ -90,14 +91,14 @@ def list_tasks() -> list[Task]:
 
 
 def get_task(task_id: str) -> str:
-    """Return full task details as JSON."""
+    """返回 JSON 格式的完整任务详情。"""
     task = load_task(task_id)
     return json.dumps(asdict(task), indent=2)
 
 
 def can_start(task_id: str) -> bool:
-    """Check if all blockedBy dependencies are completed.
-    Missing dependencies are treated as blocked."""
+    """检查是否所有 blockedBy 的前置依赖都已完成。
+    缺失的依赖同样会被视为阻塞状态。"""
     task = load_task(task_id)
     for dep_id in task.blockedBy:
         if not _task_path(dep_id).exists():
@@ -110,44 +111,44 @@ def can_start(task_id: str) -> bool:
 def claim_task(task_id: str, owner: str = "agent") -> str:
     task = load_task(task_id)
     if task.status != "pending":
-        return f"Task {task_id} is {task.status}, cannot claim"
+        return f"任务 {task_id} 当前状态为 {task.status}，无法认领"
     if not can_start(task_id):
         deps = [d for d in task.blockedBy
                 if not _task_path(d).exists() or load_task(d).status != "completed"]
-        return f"Blocked by: {deps}"
+        return f"被以下依赖阻塞: {deps}"
     task.owner = owner
     task.status = "in_progress"
     save_task(task)
-    print(f"  \033[36m[claim] {task.subject} → in_progress (owner: {owner})\033[0m")
-    return f"Claimed {task.id} ({task.subject})"
+    print(f"  \033[36m[认领任务] {task.subject} → in_progress (归属: {owner})\033[0m")
+    return f"已认领 {task.id} ({task.subject})"
 
 
 def complete_task(task_id: str) -> str:
     task = load_task(task_id)
     if task.status != "in_progress":
-        return f"Task {task_id} is {task.status}, cannot complete"
+        return f"任务 {task_id} 当前状态为 {task.status}，无法完成"
     task.status = "completed"
     save_task(task)
     unblocked = [t.subject for t in list_tasks()
                  if t.status == "pending" and t.blockedBy and can_start(t.id)]
-    print(f"  \033[32m[complete] {task.subject} ✓\033[0m")
-    msg = f"Completed {task.id} ({task.subject})"
+    print(f"  \033[32m[完成任务] {task.subject} ✓\033[0m")
+    msg = f"已完成 {task.id} ({task.subject})"
     if unblocked:
-        msg += f"\nUnblocked: {', '.join(unblocked)}"
-        print(f"  \033[33m[unblocked] {', '.join(unblocked)}\033[0m")
+        msg += f"\n解除阻塞: {', '.join(unblocked)}"
+        print(f"  \033[33m[解除阻塞] {', '.join(unblocked)}\033[0m")
     return msg
 
 
-# ── Prompt Assembly (from s10, synced) ──
+# ── 提示词组装 (同步自 s10) ──
 
 PROMPT_SECTIONS = {
-    "identity": "You are a coding agent. Act, don't explain.",
-    "tools": "Available tools: bash, read_file, write_file, "
+    "identity": "你是一个代码智能体。请直接行动，不要过多解释。",
+    "tools": "可用工具: bash, read_file, write_file, "
              "get_task, create_task, list_tasks, claim_task, complete_task, "
              "schedule_cron, list_crons, cancel_cron, "
              "spawn_teammate, send_message, check_inbox.",
-    "workspace": f"Working directory: {WORKDIR}",
-    "memory": "Relevant memories are injected below when available.",
+    "workspace": f"当前工作目录: {WORKDIR}",
+    "memory": "相关的历史记忆会在可用时被注入到下方。",
 }
 
 
@@ -157,7 +158,7 @@ def assemble_system_prompt(context: dict) -> str:
                 PROMPT_SECTIONS["workspace"]]
     memories = context.get("memories", "")
     if memories:
-        sections.append(f"Relevant memories:\n{memories}")
+        sections.append(f"相关记忆:\n{memories}")
     return "\n\n".join(sections)
 
 
@@ -174,34 +175,33 @@ def get_system_prompt(context: dict) -> str:
     return _last_prompt
 
 
-# ── Tools ──
+# ── 基础工具 (Tools) ──
 
 def safe_path(p: str) -> Path:
     path = (WORKDIR / p).resolve()
     if not path.is_relative_to(WORKDIR):
-        raise ValueError(f"Path escapes workspace: {p}")
+        raise ValueError(f"路径越界，跳出了工作目录: {p}")
     return path
 
 
 def run_bash(command: str, run_in_background: bool = False) -> str:
-    # run_in_background is handled by agent_loop dispatch, not here
     try:
         r = subprocess.run(command, shell=True, cwd=WORKDIR,
                            capture_output=True, text=True, timeout=120)
         out = (r.stdout + r.stderr).strip()
-        return out[:50000] if out else "(no output)"
+        return out[:50000] if out else "(无输出)"
     except subprocess.TimeoutExpired:
-        return "Error: Timeout (120s)"
+        return "错误: 命令执行超时 (120秒)"
 
 
-def run_read(path: str, limit: int | None = None) -> str:
+def run_read(path: str, limit: Optional[int] = None) -> str:
     try:
         lines = safe_path(path).read_text().splitlines()
         if limit and limit < len(lines):
-            lines = lines[:limit] + [f"... ({len(lines) - limit} more lines)"]
+            lines = lines[:limit] + [f"... (省略了剩余 {len(lines) - limit} 行)"]
         return "\n".join(lines)
     except Exception as e:
-        return f"Error: {e}"
+        return f"读取错误: {e}"
 
 
 def run_write(path: str, content: str) -> str:
@@ -209,30 +209,30 @@ def run_write(path: str, content: str) -> str:
         fp = safe_path(path)
         fp.parent.mkdir(parents=True, exist_ok=True)
         fp.write_text(content)
-        return f"Wrote {len(content)} bytes to {path}"
+        return f"成功写入 {len(content)} 字节到 {path}"
     except Exception as e:
-        return f"Error: {e}"
+        return f"写入错误: {e}"
 
 
-# Task tools
+# 任务相关工具 (Task tools)
 
 def run_create_task(subject: str, description: str = "",
                     blockedBy: list[str] | None = None) -> str:
     task = create_task(subject, description, blockedBy)
-    deps = f" (blockedBy: {', '.join(blockedBy)})" if blockedBy else ""
-    print(f"  \033[34m[create] {task.subject}{deps}\033[0m")
-    return f"Created {task.id}: {task.subject}{deps}"
+    deps = f" (被阻塞于: {', '.join(blockedBy)})" if blockedBy else ""
+    print(f"  \033[34m[创建任务] {task.subject}{deps}\033[0m")
+    return f"已创建 {task.id}: {task.subject}{deps}"
 
 
 def run_list_tasks() -> str:
     tasks = list_tasks()
     if not tasks:
-        return "No tasks. Use create_task to add some."
+        return "当前无任务。请使用 create_task 创建任务。"
     lines = []
     for t in tasks:
         icon = {"pending": "○", "in_progress": "●",
                 "completed": "✓"}.get(t.status, "?")
-        deps = f" (blockedBy: {', '.join(t.blockedBy)})" if t.blockedBy else ""
+        deps = f" (被阻塞于: {', '.join(t.blockedBy)})" if t.blockedBy else ""
         owner = f" [{t.owner}]" if t.owner else ""
         lines.append(f"  {icon} {t.id}: {t.subject} "
                      f"[{t.status}]{owner}{deps}")
@@ -243,7 +243,7 @@ def run_get_task(task_id: str) -> str:
     try:
         return get_task(task_id)
     except FileNotFoundError:
-        return f"Error: Task {task_id} not found"
+        return f"错误: 未找到任务 {task_id}"
 
 
 def run_claim_task(task_id: str) -> str:
@@ -254,7 +254,7 @@ def run_complete_task(task_id: str) -> str:
     return complete_task(task_id)
 
 
-# ── Background Tasks (from s13, synced) ──
+# ── 后台任务系统 (同步自 s13) ──
 
 _bg_counter = 0
 background_tasks: dict[str, dict] = {}
@@ -263,7 +263,6 @@ background_lock = threading.Lock()
 
 
 def is_slow_operation(tool_name: str, tool_input: dict) -> bool:
-    """Fallback heuristic: commands likely to take > 30s."""
     if tool_name != "bash":
         return False
     cmd = tool_input.get("command", "").lower()
@@ -274,14 +273,12 @@ def is_slow_operation(tool_name: str, tool_input: dict) -> bool:
 
 
 def should_run_background(tool_name: str, tool_input: dict) -> bool:
-    """Model explicit request takes priority; fallback to heuristic."""
     if tool_input.get("run_in_background"):
         return True
     return is_slow_operation(tool_name, tool_input)
 
 
 def execute_tool(block) -> str:
-    """Execute a tool call block, return output."""
     handler = {
         "bash": run_bash, "read_file": run_read, "write_file": run_write,
         "create_task": run_create_task, "list_tasks": run_list_tasks,
@@ -294,11 +291,10 @@ def execute_tool(block) -> str:
     }.get(block.name)
     if handler:
         return handler(**block.input)
-    return f"Unknown tool: {block.name}"
+    return f"未知工具: {block.name}"
 
 
 def start_background_task(block) -> str:
-    """Run tool in a daemon thread. Returns background task ID."""
     global _bg_counter
     _bg_counter += 1
     bg_id = f"bg_{_bg_counter:04d}"
@@ -317,12 +313,11 @@ def start_background_task(block) -> str:
             "status": "running",
         }
     threading.Thread(target=worker, daemon=True).start()
-    print(f"  \033[33m[background] dispatched {bg_id}: {cmd[:40]}\033[0m")
+    print(f"  \033[33m[后台运行] 已派发 {bg_id}: {cmd[:40]}\033[0m")
     return bg_id
 
 
 def collect_background_results() -> list[str]:
-    """Collect completed background results as task_notification messages."""
     with background_lock:
         ready_ids = [bid for bid, task in background_tasks.items()
                      if task["status"] == "completed"]
@@ -339,12 +334,12 @@ def collect_background_results() -> list[str]:
             f"  <command>{task['command']}</command>\n"
             f"  <summary>{summary}</summary>\n"
             f"</task_notification>")
-        print(f"  \033[32m[background done] {bg_id}: "
-              f"{task['command'][:40]} ({len(output)} chars)\033[0m")
+        print(f"  \033[32m[后台完成] {bg_id}: "
+              f"{task['command'][:40]} (共 {len(output)} 个字符)\033[0m")
     return notifications
 
 
-# ── Cron Scheduler (from s14, synced) ──
+# ── 定时任务调度器 (同步自 s14) ──
 
 DURABLE_PATH = WORKDIR / ".scheduled_tasks.json"
 
@@ -353,9 +348,9 @@ DURABLE_PATH = WORKDIR / ".scheduled_tasks.json"
 class CronJob:
     id: str
     cron: str        # "0 9 * * *"
-    prompt: str      # message to inject when fired
-    recurring: bool  # True = recurring, False = one-shot
-    durable: bool    # True = persist to disk
+    prompt: str      # 触发时注入的提示信息
+    recurring: bool  # True = 循环执行, False = 单次执行
+    durable: bool    # True = 持久化到磁盘
 
 
 scheduled_jobs: dict[str, CronJob] = {}
@@ -365,7 +360,6 @@ _last_fired: dict[str, str] = {}  # job_id → "YYYY-MM-DD HH:MM"
 
 
 def _cron_field_matches(field: str, value: int) -> bool:
-    """Match a single cron field against a value."""
     if field == "*":
         return True
     if field.startswith("*/"):
@@ -381,13 +375,11 @@ def _cron_field_matches(field: str, value: int) -> bool:
 
 
 def cron_matches(cron_expr: str, dt: datetime) -> bool:
-    """Check if a 5-field cron expression matches the given datetime.
-    Standard cron semantics: DOM and DOW use OR when both are constrained."""
     fields = cron_expr.strip().split()
     if len(fields) != 5:
         return False
     minute, hour, dom, month, dow = fields
-    dow_val = (dt.weekday() + 1) % 7  # Python Monday=0 → cron Sunday=0
+    dow_val = (dt.weekday() + 1) % 7
 
     m = _cron_field_matches(minute, dt.minute)
     h = _cron_field_matches(hour, dt.hour)
@@ -395,10 +387,8 @@ def cron_matches(cron_expr: str, dt: datetime) -> bool:
     month_ok = _cron_field_matches(month, dt.month)
     dow_ok = _cron_field_matches(dow, dow_val)
 
-    # Minute, hour, month must all match
     if not (m and h and month_ok):
         return False
-    # DOM and DOW: if both constrained, either matching is enough (OR)
     dom_unconstrained = dom == "*"
     dow_unconstrained = dow == "*"
     if dom_unconstrained and dow_unconstrained:
@@ -410,17 +400,16 @@ def cron_matches(cron_expr: str, dt: datetime) -> bool:
     return dom_ok or dow_ok
 
 
-def _validate_cron_field(field: str, lo: int, hi: int) -> str | None:
-    """Validate a single cron field value is within [lo, hi]."""
+def _validate_cron_field(field: str, lo: int, hi: int) -> Optional[str]:
     if field == "*":
         return None
     if field.startswith("*/"):
         step_str = field[2:]
         if not step_str.isdigit():
-            return f"Invalid step: {field}"
+            return f"步长无效: {field}"
         step = int(step_str)
         if step <= 0:
-            return f"Step must be > 0: {field}"
+            return f"步长必须大于 0: {field}"
         return None
     if "," in field:
         for part in field.split(","):
@@ -430,26 +419,25 @@ def _validate_cron_field(field: str, lo: int, hi: int) -> str | None:
     if "-" in field:
         parts = field.split("-", 1)
         if not parts[0].isdigit() or not parts[1].isdigit():
-            return f"Invalid range: {field}"
+            return f"范围无效: {field}"
         a, b = int(parts[0]), int(parts[1])
         if a < lo or a > hi or b < lo or b > hi:
-            return f"Range {field} out of bounds [{lo}-{hi}]"
+            return f"范围 {field} 越界 [{lo}-{hi}]"
         if a > b:
-            return f"Range start > end: {field}"
+            return f"范围起点大于终点: {field}"
         return None
     if not field.isdigit():
-        return f"Invalid field: {field}"
+        return f"无效字段: {field}"
     val = int(field)
     if val < lo or val > hi:
-        return f"Value {val} out of bounds [{lo}-{hi}]"
+        return f"值 {val} 越界 [{lo}-{hi}]"
     return None
 
 
-def validate_cron(cron_expr: str) -> str | None:
-    """Validate a cron expression. Returns error message or None."""
+def validate_cron(cron_expr: str) -> Optional[str]:
     fields = cron_expr.strip().split()
     if len(fields) != 5:
-        return f"Expected 5 fields, got {len(fields)}"
+        return f"期望 5 个字段，但得到了 {len(fields)} 个"
     bounds = [(0, 59), (0, 23), (1, 31), (1, 12), (0, 6)]
     names = ["minute", "hour", "day-of-month", "month", "day-of-week"]
     for i, (field, (lo, hi), name) in enumerate(zip(fields, bounds, names)):
@@ -460,13 +448,11 @@ def validate_cron(cron_expr: str) -> str | None:
 
 
 def save_durable_jobs():
-    """Persist durable jobs to .scheduled_tasks.json."""
     durable = [asdict(j) for j in scheduled_jobs.values() if j.durable]
     DURABLE_PATH.write_text(json.dumps(durable, indent=2))
 
 
 def load_durable_jobs():
-    """Load durable jobs from disk on startup."""
     if not DURABLE_PATH.exists():
         return
     try:
@@ -475,19 +461,18 @@ def load_durable_jobs():
             job = CronJob(**j)
             err = validate_cron(job.cron)
             if err:
-                print(f"  \033[31m[cron] skipping invalid job {job.id}: {err}\033[0m")
+                print(f"  \033[31m[定时任务] 跳过无效任务 {job.id}: {err}\033[0m")
                 continue
             scheduled_jobs[job.id] = job
         valid = [j for j in jobs if j["id"] in scheduled_jobs]
         if valid:
-            print(f"  \033[35m[cron] loaded {len(valid)} durable job(s)\033[0m")
+            print(f"  \033[35m[定时任务] 成功加载 {len(valid)} 个持久化任务\033[0m")
     except Exception:
         pass
 
 
 def schedule_job(cron: str, prompt: str, recurring: bool = True,
                  durable: bool = True) -> CronJob | str:
-    """Register a new cron job. Returns CronJob or error string."""
     err = validate_cron(cron)
     if err:
         return err
@@ -500,30 +485,25 @@ def schedule_job(cron: str, prompt: str, recurring: bool = True,
         scheduled_jobs[job.id] = job
     if durable:
         save_durable_jobs()
-    print(f"  \033[35m[cron register] {job.id} '{cron}' → {prompt[:40]}\033[0m")
+    print(f"  \033[35m[注册定时任务] {job.id} '{cron}' → {prompt[:40]}\033[0m")
     return job
 
 
 def cancel_job(job_id: str) -> str:
-    """Cancel a cron job."""
     with cron_lock:
         job = scheduled_jobs.pop(job_id, None)
     if not job:
-        return f"Job {job_id} not found"
+        return f"未找到任务 {job_id}"
     if job.durable:
         save_durable_jobs()
-    print(f"  \033[31m[cron cancel] {job_id}\033[0m")
-    return f"Cancelled {job_id}"
+    print(f"  \033[31m[取消定时任务] {job_id}\033[0m")
+    return f"已取消 {job_id}"
 
 
 def cron_scheduler_loop():
-    """Independent daemon thread: poll every 1s, fire matching jobs.
-    Individual job errors are caught to prevent one bad job from
-    killing the entire scheduler thread."""
     while True:
         time.sleep(1)
         now = datetime.now()
-        # Date-aware marker prevents daily jobs from skipping on day 2+
         minute_marker = now.strftime("%Y-%m-%d %H:%M")
         with cron_lock:
             for job in list(scheduled_jobs.values()):
@@ -532,49 +512,48 @@ def cron_scheduler_loop():
                         if _last_fired.get(job.id) != minute_marker:
                             cron_queue.append(job)
                             _last_fired[job.id] = minute_marker
-                            print(f"  \033[35m[cron fire] {job.id} → "
+                            print(f"  \033[35m[触发定时任务] {job.id} → "
                                   f"{job.prompt[:40]}\033[0m")
                         if not job.recurring:
                             scheduled_jobs.pop(job.id, None)
                             if job.durable:
                                 save_durable_jobs()
                 except Exception as e:
-                    print(f"  \033[31m[cron error] {job.id}: {e}\033[0m")
+                    print(f"  \033[31m[定时任务错误] {job.id}: {e}\033[0m")
 
 
 def consume_cron_queue() -> list[CronJob]:
-    """Consume fired jobs from cron_queue (called by agent_loop)."""
     with cron_lock:
         fired = list(cron_queue)
         cron_queue.clear()
     return fired
 
 
-# Load durable jobs on startup, then start scheduler thread
+# 启动时加载持久化任务，并开启调度器线程
 load_durable_jobs()
 threading.Thread(target=cron_scheduler_loop, daemon=True).start()
-print("  \033[35m[cron] scheduler thread started\033[0m")
+print("  \033[35m[定时任务] 调度器线程已启动\033[0m")
 
 
-# Cron tool handlers
+# ── 定时任务工具 (Cron Tools) ──
 
 def run_schedule_cron(cron: str, prompt: str,
                       recurring: bool = True, durable: bool = True) -> str:
     result = schedule_job(cron, prompt, recurring, durable)
     if isinstance(result, str):
-        return f"Error: {result}"
-    return f"Scheduled {result.id}: '{cron}' → {prompt}"
+        return f"错误: {result}"
+    return f"已调度 {result.id}: '{cron}' → {prompt}"
 
 
 def run_list_crons() -> str:
     with cron_lock:
         jobs = list(scheduled_jobs.values())
     if not jobs:
-        return "No cron jobs. Use schedule_cron to add one."
+        return "当前无定时任务。请使用 schedule_cron 添加。"
     lines = []
     for j in jobs:
-        tag = "recurring" if j.recurring else "one-shot"
-        dur = "durable" if j.durable else "session"
+        tag = "循环" if j.recurring else "单次"
+        dur = "持久化" if j.durable else "会话级"
         lines.append(f"  {j.id}: '{j.cron}' → {j.prompt[:40]} "
                      f"[{tag}, {dur}]")
     return "\n".join(lines)
@@ -584,18 +563,17 @@ def run_cancel_cron(job_id: str) -> str:
     return cancel_job(job_id)
 
 
-# ── MessageBus (s15 new) ──
-# Teaching version uses simple file append + unlink.
-# Real CC uses proper-lockfile for concurrent write safety.
+# ── 消息总线 (MessageBus, s15 新增) ──
+# 教学版使用简单的文件追加写入 + 删除。
+# 在真正的 Claude Code 中会使用 proper-lockfile 保证并发写入安全。
 
 MAILBOX_DIR = WORKDIR / ".mailboxes"
 MAILBOX_DIR.mkdir(exist_ok=True)
 
 
 class MessageBus:
-    """File-based message bus. Each agent has a .jsonl inbox.
-    Read is destructive: read_text + unlink (consumes messages).
-    Teaching version: no file locking; real CC uses proper-lockfile."""
+    """基于文件的消息总线。每个 Agent 都有自己的 .jsonl 邮箱。
+    读取是破坏性的：读取后即刻删除文件 (消费消息)。"""
 
     def send(self, from_agent: str, to_agent: str, content: str,
              msg_type: str = "message"):
@@ -605,7 +583,7 @@ class MessageBus:
         inbox = MAILBOX_DIR / f"{to_agent}.jsonl"
         with open(inbox, "a") as f:
             f.write(json.dumps(msg) + "\n")
-        print(f"  \033[33m[bus] {from_agent} → {to_agent}: "
+        print(f"  \033[33m[消息总线] {from_agent} → {to_agent}: "
               f"{content[:50]}\033[0m")
 
     def read_inbox(self, agent: str) -> list[dict]:
@@ -614,48 +592,48 @@ class MessageBus:
             return []
         msgs = [json.loads(line) for line in inbox.read_text().splitlines()
                 if line.strip()]
-        inbox.unlink()  # consume: read + delete
+        inbox.unlink()  # 消费机制: 读完即删
         return msgs
 
 
 BUS = MessageBus()
 
-# Track spawned teammates
+# 追踪当前活跃的队友 Agent
 active_teammates: dict[str, bool] = {}
 
 
-# ── Teammate Thread (s15 new) ──
+# ── 队友线程 (Teammate Thread, s15 新增) ──
 
 def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
-    """Spawn a teammate agent in a background thread.
-    Teaching version: max 10 rounds per teammate.
-    Real CC: teammates use idle loop (wait for inbox, work, repeat)
-    until shutdown_request."""
+    """在后台线程中孵化队友 Agent。
+    教学版限制：每个队友最多运行 10 轮。
+    真正的 Claude Code：队友会使用闲置循环（等待信箱消息、执行任务、重复）直至收到关闭指令。"""
     if name in active_teammates:
-        return f"Teammate '{name}' already exists"
+        return f"队友 '{name}' 已经存在"
 
-    system = (f"You are '{name}', a {role}. "
-              f"Use tools to complete tasks. "
-              f"Send results via send_message to 'lead'.")
+    system = (f"你是 '{name}'，担任 {role} 角色。"
+              f"请使用工具完成任务。"
+              f"通过 send_message 将结果发送给 'lead' (主节点)。")
 
     def run():
         messages = [{"role": "user", "content": prompt}]
+        # 队友的精简版工具集
         sub_tools = [
-            {"name": "bash", "description": "Run a shell command.",
+            {"name": "bash", "description": "运行 Shell 命令。",
              "input_schema": {"type": "object",
                               "properties": {"command": {"type": "string"}},
                               "required": ["command"]}},
-            {"name": "read_file", "description": "Read file contents.",
+            {"name": "read_file", "description": "读取文件内容。",
              "input_schema": {"type": "object",
                               "properties": {"path": {"type": "string"}},
                               "required": ["path"]}},
-            {"name": "write_file", "description": "Write content to a file.",
+            {"name": "write_file", "description": "将内容写入文件。",
              "input_schema": {"type": "object",
                               "properties": {"path": {"type": "string"},
                                              "content": {"type": "string"}},
                               "required": ["path", "content"]}},
             {"name": "send_message",
-             "description": "Send a message to another agent.",
+             "description": "给另一个 Agent 发送消息。",
              "input_schema": {"type": "object",
                               "properties": {"to": {"type": "string"},
                                              "content": {"type": "string"}},
@@ -664,9 +642,10 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
         sub_handlers = {
             "bash": run_bash, "read_file": run_read, "write_file": run_write,
             "send_message": lambda to, content: (BUS.send(name, to, content),
-                                                  "Sent")[1],
+                                                  "已发送")[1],
         }
 
+        # 限定最多交互 10 轮以防死循环
         for _ in range(10):
             inbox = BUS.read_inbox(name)
             if inbox:
@@ -685,14 +664,14 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
             for block in response.content:
                 if block.type == "tool_use":
                     handler = sub_handlers.get(block.name)
-                    output = handler(**block.input) if handler else "Unknown"
+                    output = handler(**block.input) if handler else "未知命令"
                     results.append({"type": "tool_result",
                                     "tool_use_id": block.id,
                                     "content": str(output)})
             messages.append({"role": "user", "content": results})
 
-        # Send final summary to Lead
-        summary = "Done."
+        # 结束后向主节点 (Lead) 发送最终总结
+        summary = "完成。"
         for msg in reversed(messages):
             if msg["role"] == "assistant" and isinstance(msg["content"], list):
                 for b in msg["content"]:
@@ -704,15 +683,15 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
                 break
         BUS.send(name, "lead", summary, "result")
         active_teammates.pop(name, None)
-        print(f"  \033[32m[teammate] {name} finished\033[0m")
+        print(f"  \033[32m[队友] {name} 执行完毕\033[0m")
 
     active_teammates[name] = True
     threading.Thread(target=run, daemon=True).start()
-    print(f"  \033[36m[teammate] {name} spawned as {role}\033[0m")
-    return f"Teammate '{name}' spawned as {role}"
+    print(f"  \033[36m[队友] 成功孵化 {name} 作为 {role}\033[0m")
+    return f"已成功孵化队友 '{name}' 作为 {role}"
 
 
-# ── Team Tool Handlers (s15 new) ──
+# ── 团队协作工具 (Team Tool Handlers, s15 新增) ──
 
 def run_spawn_teammate(name: str, role: str, prompt: str) -> str:
     return spawn_teammate_thread(name, role, prompt)
@@ -720,40 +699,40 @@ def run_spawn_teammate(name: str, role: str, prompt: str) -> str:
 
 def run_send_message(to: str, content: str) -> str:
     BUS.send("lead", to, content)
-    return f"Sent to {to}"
+    return f"已发送至 {to}"
 
 
 def run_check_inbox() -> str:
     msgs = BUS.read_inbox("lead")
     if not msgs:
-        return "(inbox empty)"
+        return "(收件箱为空)"
     lines = []
     for m in msgs:
         lines.append(f"  [{m['from']}] {m['content'][:200]}")
     return "\n".join(lines)
 
 
-# ── Tool Definitions ──
+# ── 工具定义 ──
 
 TOOLS = [
-    {"name": "bash", "description": "Run a shell command.",
+    {"name": "bash", "description": "运行 Shell 命令。",
      "input_schema": {"type": "object",
                       "properties": {
                           "command": {"type": "string"},
                           "run_in_background": {"type": "boolean"}},
                       "required": ["command"]}},
-    {"name": "read_file", "description": "Read file contents.",
+    {"name": "read_file", "description": "读取文件内容。",
      "input_schema": {"type": "object",
                       "properties": {"path": {"type": "string"},
                                      "limit": {"type": "integer"}},
                       "required": ["path"]}},
-    {"name": "write_file", "description": "Write content to a file.",
+    {"name": "write_file", "description": "将内容写入文件。",
      "input_schema": {"type": "object",
                       "properties": {"path": {"type": "string"},
                                      "content": {"type": "string"}},
                       "required": ["path", "content"]}},
     {"name": "create_task",
-     "description": "Create a new task with optional blockedBy dependencies.",
+     "description": "创建一个新任务，可附带 blockedBy 前置依赖。",
      "input_schema": {"type": "object",
                       "properties": {
                           "subject": {"type": "string"},
@@ -762,48 +741,48 @@ TOOLS = [
                                         "items": {"type": "string"}}},
                       "required": ["subject"]}},
     {"name": "list_tasks",
-     "description": "List all tasks with status, owner, and dependencies.",
+     "description": "列出所有任务，包含其状态、归属及依赖关系。",
      "input_schema": {"type": "object", "properties": {},
                       "required": []}},
     {"name": "get_task",
-     "description": "Get full details of a specific task by ID.",
+     "description": "根据 ID 获取指定任务的完整详情。",
      "input_schema": {"type": "object",
                       "properties": {"task_id": {"type": "string"}},
                       "required": ["task_id"]}},
     {"name": "claim_task",
-     "description": "Claim a pending task. Sets owner, changes status to in_progress.",
+     "description": "认领一个处于 pending 状态的任务。分配 owner 并将状态转为 in_progress。",
      "input_schema": {"type": "object",
                       "properties": {"task_id": {"type": "string"}},
                       "required": ["task_id"]}},
     {"name": "complete_task",
-     "description": "Complete an in-progress task. Reports unblocked downstream tasks.",
+     "description": "完成一个 in_progress 的任务。会汇报因此解除阻塞的下游任务。",
      "input_schema": {"type": "object",
                       "properties": {"task_id": {"type": "string"}},
                       "required": ["task_id"]}},
     {"name": "schedule_cron",
-     "description": "Schedule a cron job. cron is 5-field: min hour dom month dow.",
+     "description": "调度一个定时任务。cron 表达式需 5 位: 分钟 小时 日 月 星期。",
      "input_schema": {"type": "object",
                       "properties": {
                           "cron": {"type": "string",
-                                   "description": "5-field cron expression"},
+                                   "description": "5 位 cron 表达式"},
                           "prompt": {"type": "string",
-                                     "description": "Message to inject when fired"},
+                                     "description": "触发时注入的信息"},
                           "recurring": {"type": "boolean",
-                                        "description": "True=recurring, False=one-shot"},
+                                        "description": "True=循环执行, False=单次执行"},
                           "durable": {"type": "boolean",
-                                      "description": "True=persist to disk"}},
+                                      "description": "True=持久化到磁盘"}},
                       "required": ["cron", "prompt"]}},
     {"name": "list_crons",
-     "description": "List all registered cron jobs.",
+     "description": "列出所有已注册的定时任务。",
      "input_schema": {"type": "object", "properties": {},
                       "required": []}},
     {"name": "cancel_cron",
-     "description": "Cancel a cron job by ID.",
+     "description": "根据 ID 取消一个定时任务。",
      "input_schema": {"type": "object",
                       "properties": {"job_id": {"type": "string"}},
                       "required": ["job_id"]}},
     {"name": "spawn_teammate",
-     "description": "Spawn a teammate agent in a background thread.",
+     "description": "在后台线程孵化（创建）一个队友 Agent。",
      "input_schema": {"type": "object",
                       "properties": {
                           "name": {"type": "string"},
@@ -811,22 +790,22 @@ TOOLS = [
                           "prompt": {"type": "string"}},
                       "required": ["name", "role", "prompt"]}},
     {"name": "send_message",
-     "description": "Send a message to a teammate via MessageBus.",
+     "description": "通过消息总线给队友发送消息。",
      "input_schema": {"type": "object",
                       "properties": {"to": {"type": "string"},
                                      "content": {"type": "string"}},
                       "required": ["to", "content"]}},
     {"name": "check_inbox",
-     "description": "Check Lead's inbox for teammate messages.",
+     "description": "检查主节点 (Lead) 收件箱中是否有队友发来的消息。",
      "input_schema": {"type": "object", "properties": {},
                       "required": []}},
 ]
 
 
-# ── Context ──
+# ── 上下文环境 (Context) ──
 
 def update_context(context: dict, messages: list) -> dict:
-    """Derive context from real state."""
+    """根据真实状态推导并更新上下文环境。"""
     memories = ""
     if MEMORY_INDEX.exists():
         content = MEMORY_INDEX.read_text().strip()
@@ -839,20 +818,19 @@ def update_context(context: dict, messages: list) -> dict:
     }
 
 
-# ── Agent Loop ──
-# Teaching code keeps a basic agent loop. S11's full error recovery is omitted.
-# Cron queue is consumed when agent_loop is called; real CC auto-wakes via
-# queue processor (useQueueProcessor.ts) when items arrive.
+# ── Agent 循环 (Agent Loop) ──
+# 教学版保持了基础的 Agent 循环。
+# 定时任务队列在调用 agent_loop 时才会被消费；真正的 Claude Code 中会有队列处理器自动唤醒。
 
 def agent_loop(messages: list, context: dict):
     system = get_system_prompt(context)
     while True:
-        # Consume fired cron jobs → inject as messages
+        # 消费被触发的定时任务 → 将其作为 user 消息注入
         fired = consume_cron_queue()
         for job in fired:
             messages.append({"role": "user",
-                             "content": f"[Scheduled] {job.prompt}"})
-            print(f"  \033[35m[inject cron] {job.prompt[:50]}\033[0m")
+                             "content": f"[定时任务触发] {job.prompt}"})
+            print(f"  \033[35m[注入定时任务] {job.prompt[:50]}\033[0m")
 
         try:
             response = client.messages.create(
@@ -861,7 +839,7 @@ def agent_loop(messages: list, context: dict):
         except Exception as e:
             messages.append({"role": "assistant", "content": [
                 {"type": "text",
-                 "text": f"[Error] {type(e).__name__}: {e}"}]})
+                 "text": f"[错误] {type(e).__name__}: {e}"}]})
             return
 
         messages.append({"role": "assistant", "content": response.content})
@@ -878,8 +856,8 @@ def agent_loop(messages: list, context: dict):
                 bg_id = start_background_task(block)
                 results.append({"type": "tool_result",
                                 "tool_use_id": block.id,
-                                "content": f"[Background task {bg_id} started] "
-                                           f"Result will be available when complete."})
+                                "content": f"[后台任务 {bg_id} 已启动] "
+                                           f"任务完成后将通过通知返回结果。"})
             else:
                 output = execute_tool(block)
                 print(str(output)[:300])
@@ -887,7 +865,7 @@ def agent_loop(messages: list, context: dict):
                                 "tool_use_id": block.id,
                                 "content": output})
 
-        # Merge background notifications + tool results into one user message
+        # 在单次 user 消息中合并后台通知与常规工具结果
         user_content = []
         bg_notifications = collect_background_results()
         if bg_notifications:
@@ -900,8 +878,8 @@ def agent_loop(messages: list, context: dict):
 
 
 if __name__ == "__main__":
-    print("s15: agent teams")
-    print("Enter a question, press Enter to send. Type q to quit.\n")
+    print("s15: 多智能体团队 (agent teams)")
+    print("输入问题后按回车发送。输入 q 退出。\n")
     history = []
     context = update_context({}, [])
     while True:
@@ -918,12 +896,12 @@ if __name__ == "__main__":
             if getattr(block, "type", None) == "text":
                 print(block.text)
 
-        # Check inbox for teammate results → inject into history
+        # 检查收件箱中的队友消息 → 并将其注入到历史记录中
         inbox = BUS.read_inbox("lead")
         if inbox:
             inbox_text = "\n".join(
-                f"From {m['from']}: {m['content'][:200]}" for m in inbox)
+                f"来自 {m['from']}: {m['content'][:200]}" for m in inbox)
             history.append({"role": "user",
-                            "content": f"[Inbox]\n{inbox_text}"})
-            print(f"\n\033[33m[Inbox: {len(inbox)} messages injected]\033[0m")
+                            "content": f"[收件箱]\n{inbox_text}"})
+            print(f"\n\033[33m[收件箱: 已注入 {len(inbox)} 条队友消息]\033[0m")
         print()

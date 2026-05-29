@@ -13,6 +13,7 @@ teams, protocols, autonomous agents, worktrees, and MCP.
 
 import os, subprocess, json, time, random, threading, re
 from pathlib import Path
+from typing import Optional
 from datetime import datetime
 from dataclasses import dataclass, asdict, field
 
@@ -32,7 +33,7 @@ if os.getenv("ANTHROPIC_BASE_URL"):
 
 WORKDIR = Path.cwd()
 client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
-MODEL = os.environ["MODEL_ID"]
+MODEL = os.getenv("MODEL_ID", "deepseek-v4-pro")
 PRIMARY_MODEL = MODEL
 FALLBACK_MODEL = os.getenv("FALLBACK_MODEL_ID")
 
@@ -55,6 +56,10 @@ CLI_ACTIVE = False
 
 
 def terminal_print(text: str):
+    """
+    终端输出的美化包装。
+    温柔地抹去旧痕迹，在多线程的纷扰中维持那一抹从容。
+    """
     if threading.current_thread() is threading.main_thread() or not CLI_ACTIVE:
         print(text)
         return
@@ -67,10 +72,10 @@ def terminal_print(text: str):
     print(f"\r\033[K{text}")
     print(PROMPT + line, end="", flush=True)
 
-# ── Task System ──
+# ── 任务系统 (Task System) ──
+# 任务是微小而持久的记忆锚点。后续系统在此基础上赋予它所有权、依赖与工作树，
+# 用简单的状态流转，看破复杂协同的虚妄。
 
-# Tasks are tiny durable records. Later systems add ownership, dependencies,
-# worktrees, and teammates on top of this same file-backed state.
 TASKS_DIR = WORKDIR / ".tasks"
 TASKS_DIR.mkdir(exist_ok=True)
 CURRENT_TODOS: list[dict] = []
@@ -82,9 +87,9 @@ class Task:
     subject: str
     description: str
     status: str
-    owner: str | None
+    owner: Optional[str]
     blockedBy: list[str]
-    worktree: str | None = None
+    worktree: Optional[str] = None
 
 
 def _task_path(task_id: str) -> Path:
@@ -93,6 +98,7 @@ def _task_path(task_id: str) -> Path:
 
 def create_task(subject: str, description: str = "",
                 blockedBy: list[str] | None = None) -> Task:
+    """创造一个新任务。每一次具名，都是对混沌的一次梳理。"""
     task = Task(
         id=f"task_{int(time.time())}_{random.randint(0, 9999):04d}",
         subject=subject, description=description,
@@ -121,8 +127,10 @@ def get_task_json(task_id: str) -> str:
 
 
 def can_start(task_id: str) -> bool:
-    # Dependencies are intentionally simple: every blocker must exist and be
-    # completed before the task can be claimed.
+    """
+    判断任务是否可启动。
+    依赖法则如命运般严苛：每一个前置阻塞都必须被终结，方能开启新篇。
+    """
     task = load_task(task_id)
     for dep_id in task.blockedBy:
         if not _task_path(dep_id).exists():
@@ -133,6 +141,7 @@ def can_start(task_id: str) -> bool:
 
 
 def claim_task(task_id: str, owner: str = "agent") -> str:
+    """认领任务：赋予它唯一的归属，从此它的命运便与认领者绑定。"""
     task = load_task(task_id)
     if task.status != "pending":
         return f"Task {task_id} is {task.status}, cannot claim"
@@ -154,6 +163,7 @@ def claim_task(task_id: str, owner: str = "agent") -> str:
 
 
 def complete_task(task_id: str) -> str:
+    """终结任务，并唤醒那些等待它完成的沉睡者。"""
     task = load_task(task_id)
     if task.status != "in_progress":
         return f"Task {task_id} is {task.status}, cannot complete"
@@ -168,17 +178,17 @@ def complete_task(task_id: str) -> str:
     return msg
 
 
-# ── Worktree System ──
+# ── 工作树系统 (Worktree System) ──
+# 隔离的净土。让并行的意图在各自的沙盒中生长，互不惊扰。
 
-# Worktree names become filesystem paths, so the teaching version keeps the
-# validation rules strict and reuses them for create/remove/keep.
 WORKTREES_DIR = WORKDIR / ".worktrees"
 WORKTREES_DIR.mkdir(exist_ok=True)
 
 VALID_WT_NAME = re.compile(r'^[A-Za-z0-9._-]{1,64}$')
 
 
-def validate_worktree_name(name: str) -> str | None:
+def validate_worktree_name(name: str) -> Optional[str]:
+    """名字的校验，是守住沙盒边界的第一道克制。"""
     if not name:
         return "Worktree name cannot be empty"
     if name in (".", ".."):
@@ -190,6 +200,7 @@ def validate_worktree_name(name: str) -> str | None:
 
 
 def run_git(args: list[str]) -> tuple[bool, str]:
+    """底层 Git 调用的静默执行者。"""
     try:
         r = subprocess.run(["git"] + args, cwd=WORKDIR,
                            capture_output=True, text=True, timeout=30)
@@ -200,6 +211,7 @@ def run_git(args: list[str]) -> tuple[bool, str]:
 
 
 def log_event(event_type: str, worktree_name: str, task_id: str = ""):
+    """记录沙盒的生灭，不为留恋，只为可追溯的清白。"""
     event = {"type": event_type, "worktree": worktree_name,
              "task_id": task_id, "ts": time.time()}
     events_file = WORKTREES_DIR / "events.jsonl"
@@ -208,8 +220,7 @@ def log_event(event_type: str, worktree_name: str, task_id: str = ""):
 
 
 def create_worktree(name: str, task_id: str = "") -> str:
-    # Tool-layer validation is part of the safety boundary; do it before git
-    # sees the name, not only after git happens to reject something.
+    """划出一片新天地。如果附带任务，便将命运羁绊。"""
     err = validate_worktree_name(name)
     if err:
         return f"Error: {err}"
@@ -238,6 +249,7 @@ def bind_task_to_worktree(task_id: str, worktree_name: str):
 
 
 def _count_worktree_changes(path: Path) -> tuple[int, int]:
+    """冷眼盘点变动：不评判对错，只计数痕迹。"""
     try:
         r1 = subprocess.run(["git", "status", "--porcelain"],
                             cwd=path, capture_output=True, text=True, timeout=10)
@@ -251,6 +263,7 @@ def _count_worktree_changes(path: Path) -> tuple[int, int]:
 
 
 def remove_worktree(name: str, discard_changes: bool = False) -> str:
+    """抹去沙盒。若有未完的留恋（改动），则温柔地劝阻，除非强制割舍。"""
     err = validate_worktree_name(name)
     if err:
         return err
@@ -281,7 +294,8 @@ def keep_worktree(name: str) -> str:
     return f"Worktree '{name}' kept for review (branch: wt/{name})"
 
 
-# ── Skill Loading ──
+# ── 技能加载 (Skill Loading) ──
+# 动态能力注入，如拾阶而上的悟道，按需取用。
 
 SKILL_REGISTRY: dict[str, dict] = {}
 
@@ -301,6 +315,7 @@ def _parse_frontmatter(text: str) -> tuple[dict, str]:
 
 
 def scan_skills():
+    """遍历技能清单。我们不预载所有的智慧，只保留它们的索引。"""
     SKILL_REGISTRY.clear()
     if not SKILLS_DIR.exists():
         return
@@ -340,7 +355,7 @@ def load_skill(name: str) -> str:
     return skill["content"]
 
 
-# ── Prompt Assembly ──
+# ── 提示词组装 (Prompt Assembly) ──
 
 PROMPT_SECTIONS = {
     "identity": "You are a coding agent. Act, don't explain.",
@@ -358,8 +373,10 @@ PROMPT_SECTIONS = {
 
 
 def assemble_system_prompt(context: dict) -> str:
-    # The system prompt is rebuilt each turn from live context. This is where
-    # memory, skill catalog, MCP state, and active teammates become visible.
+    """
+    重塑每次交互的灵魂。
+    记忆、技能、外挂的 MCP，全在这段字里行间交汇，构建出当前世界的全貌。
+    """
     sections = [PROMPT_SECTIONS["identity"],
                 PROMPT_SECTIONS["tools"],
                 PROMPT_SECTIONS["workspace"]]
@@ -374,11 +391,10 @@ def assemble_system_prompt(context: dict) -> str:
     return "\n\n".join(sections)
 
 
-# ── Basic Tools ──
+# ── 基础工具 (Basic Tools) ──
 
 def safe_path(p: str, cwd: Path = None) -> Path:
-    # File tools stay inside the workspace or teammate worktree. Bash remains
-    # powerful on purpose and is controlled by the permission hook instead.
+    """克制的边界。将一切越界之举，悄然扼杀于摇篮中。"""
     base = cwd or WORKDIR
     path = (base / p).resolve()
     if not path.is_relative_to(base):
@@ -388,7 +404,7 @@ def safe_path(p: str, cwd: Path = None) -> Path:
 
 def run_bash(command: str, cwd: Path = None,
              run_in_background: bool = False) -> str:
-    # run_in_background is consumed by the dispatcher; direct execution ignores it.
+    """执行外壳命令。狂野的权力，交由权限钩子去套上枷锁。"""
     try:
         r = subprocess.run(command, shell=True, cwd=cwd or WORKDIR,
                            capture_output=True, text=True, timeout=120)
@@ -398,7 +414,7 @@ def run_bash(command: str, cwd: Path = None,
         return "Error: Timeout (120s)"
 
 
-def run_read(path: str, limit: int | None = None,
+def run_read(path: str, limit: Optional[int] = None,
              offset: int = 0, cwd: Path = None) -> str:
     try:
         lines = safe_path(path, cwd).read_text().splitlines()
@@ -424,6 +440,7 @@ def run_write(path: str, content: str, cwd: Path = None) -> str:
 
 def run_edit(path: str, old_text: str, new_text: str,
              cwd: Path = None) -> str:
+    """微雕手术。只对确切的印记进行替换，绝不盲目破坏。"""
     try:
         fp = safe_path(path, cwd)
         text = fp.read_text()
@@ -468,11 +485,9 @@ def run_todo_write(todos: list) -> str:
     print(f"  \033[33m[todo] updated {len(CURRENT_TODOS)} item(s)\033[0m")
     return f"Updated {len(CURRENT_TODOS)} todos"
 
+# ── 消息总线 (MessageBus) ──
+# 团队沟通的命脉。纯追加的 JSONL 邮箱，让异步的喃喃自语也能留下印记。
 
-# ── MessageBus ──
-
-# Team communication is append-only JSONL mailboxes. This keeps the protocol
-# inspectable on disk and lets background teammates send messages.
 MAILBOX_DIR = WORKDIR / ".mailboxes"
 MAILBOX_DIR.mkdir(exist_ok=True)
 
@@ -480,6 +495,7 @@ MAILBOX_DIR.mkdir(exist_ok=True)
 class MessageBus:
     def send(self, from_agent: str, to_agent: str, content: str,
              msg_type: str = "message", metadata: dict = None):
+        """投递一封信。我们不苛求即时回应，只是安静地放置。"""
         msg = {"from": from_agent, "to": to_agent,
                "content": content, "type": msg_type,
                "ts": time.time(), "metadata": metadata or {}}
@@ -490,6 +506,7 @@ class MessageBus:
                        f"({msg_type}) {content[:50]}\033[0m")
 
     def read_inbox(self, agent: str) -> list[dict]:
+        """开启信箱，阅后即焚，不留一丝包袱。"""
         inbox = MAILBOX_DIR / f"{agent}.jsonl"
         if not inbox.exists():
             return []
@@ -502,7 +519,7 @@ class MessageBus:
 BUS = MessageBus()
 active_teammates: dict[str, bool] = {}
 
-# ── Protocol State ──
+# ── 协议状态 (Protocol State) ──
 
 @dataclass
 class ProtocolState:
@@ -523,8 +540,10 @@ def new_request_id() -> str:
 
 
 def match_response(response_type: str, request_id: str, approve: bool):
-    # Responses are matched by request_id so one protocol reply cannot approve
-    # a different pending request.
+    """
+    匹配协议响应。
+    用 request_id 精准对账，免去张冠李戴的尴尬，温柔地闭合一个请求的生命周期。
+    """
     state = pending_requests.get(request_id)
     if not state:
         return
@@ -536,6 +555,7 @@ def match_response(response_type: str, request_id: str, approve: bool):
 
 
 def consume_lead_inbox(route_protocol=True) -> list[dict]:
+    """主控的信箱巡视，顺手拨动协议状态机的齿轮。"""
     msgs = BUS.read_inbox("lead")
     if route_protocol:
         for msg in msgs:
@@ -547,13 +567,14 @@ def consume_lead_inbox(route_protocol=True) -> list[dict]:
     return msgs
 
 
-# ── Autonomous Agent ──
+# ── 自主智能体 (Autonomous Agent) ──
 
 IDLE_POLL_INTERVAL = 5
 IDLE_TIMEOUT = 60
 
 
 def scan_unclaimed_tasks() -> list[dict]:
+    """在任务列表的废墟中，搜寻那些无人认领却已准备就绪的孤儿。"""
     unclaimed = []
     for f in sorted(TASKS_DIR.glob("task_*.json")):
         task = json.loads(f.read_text())
@@ -566,9 +587,11 @@ def scan_unclaimed_tasks() -> list[dict]:
 
 def idle_poll(agent_name: str, messages: list,
               name: str, role: str,
-              worktree_context: dict | None = None) -> str:
-    # Autonomous teammates wake up for inbox messages first, then look for
-    # unclaimed tasks. This keeps direct protocol messages higher priority.
+              worktree_context: Optional[dict] = None) -> str:
+    """
+    空闲轮询：休眠时的守望。
+    先倾听协议信件，再寻觅孤单任务，优先级泾渭分明，从容不迫。
+    """
     for _ in range(IDLE_TIMEOUT // IDLE_POLL_INTERVAL):
         time.sleep(IDLE_POLL_INTERVAL)
         inbox = BUS.read_inbox(agent_name)
@@ -601,14 +624,14 @@ def idle_poll(agent_name: str, messages: list,
     return "timeout"
 
 
-# ── Teammate Thread ──
+# ── 队友线程 (Teammate Thread) ──
 
 def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
+    """唤醒一位新队友。在独立的线程中，赋予他专属的人格与视野。"""
     if name in active_teammates:
         return f"Teammate '{name}' already exists"
 
-    # Plan approval is a real gate: after submit_plan, the teammate stops
-    # taking model/tool steps until lead sends plan_approval_response.
+    # 计划审批是真实的门闸：一旦提交计划，队友便在门前静候主控的回音。
     protocol_ctx = {"waiting_plan": None}
     system = (f"You are '{name}', a {role}. "
               f"Use tools to complete tasks. "
@@ -636,8 +659,7 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
         wt_ctx = {"path": None}
 
         def _wt_cwd():
-            # Once a task with a worktree is claimed, all teammate file tools
-            # transparently run inside that isolated directory.
+            # 文件工具在工作树的结界内隐形穿梭。
             p = wt_ctx["path"]
             return Path(p) if p else None
 
@@ -742,8 +764,7 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
                 if should_shutdown:
                     break
                 if protocol_ctx["waiting_plan"]:
-                    # Poll only for protocol replies while the approval gate is
-                    # closed; do not let the model continue with the task.
+                    # 审批门闸关闭时，只需静静轮询，克制前行的冲动。
                     time.sleep(IDLE_POLL_INTERVAL)
                     continue
                 if inbox and not should_shutdown:
@@ -778,8 +799,7 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
                                         "tool_use_id": block.id,
                                         "content": str(output)})
                         if protocol_ctx["waiting_plan"]:
-                            # Ignore later tool_use blocks from the same model
-                            # response; they belong after approval, not before.
+                            # 门闸一旦拉下，后续的任何多动症（多次工具调用）都应被无视。
                             break
                 messages.append({"role": "user", "content": results})
                 if protocol_ctx["waiting_plan"]:
@@ -811,6 +831,7 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
 
 
 def _teammate_submit_plan(from_name: str, plan: str) -> str:
+    """交出筹谋已久的蓝图，换取通行证。"""
     req_id = new_request_id()
     pending_requests[req_id] = ProtocolState(
         request_id=req_id, type="plan_approval",
@@ -822,7 +843,7 @@ def _teammate_submit_plan(from_name: str, plan: str) -> str:
     return f"Plan submitted ({req_id})"
 
 
-# ── Lead Protocol Tools ──
+# ── 主控协议工具 (Lead Protocol Tools) ──
 
 def run_request_shutdown(teammate: str) -> str:
     req_id = new_request_id()
@@ -853,10 +874,10 @@ def run_review_plan(request_id: str, approve: bool,
     return f"Plan {'approved' if approve else 'rejected'}"
 
 
-# ── Hooks + Permission Pipeline ──
+# ── 钩子与权限流 (Hooks + Permission Pipeline) ──
+# 钩子超脱于具体工具之外。主循环通过它们注入权限、日志与打断机制，
+# 如同在每个动作前投下一抹审视的目光。
 
-# Hooks are intentionally outside tool handlers. The loop can add permission,
-# logging, and stop behavior without changing each individual tool.
 HOOKS = {"UserPromptSubmit": [], "PreToolUse": [],
          "PostToolUse": [], "Stop": []}
 
@@ -878,8 +899,10 @@ DESTRUCTIVE = ["rm ", "> /etc/", "chmod 777"]
 
 
 def permission_hook(block):
-    # The permission layer sees the raw tool_use before dispatch. It can deny,
-    # ask the user, or allow execution to continue.
+    """
+    权限的冷眼。
+    在这里，粗糙的野心会被拦截，毁灭性的指令必须获得人性的首肯。
+    """
     if block.name == "bash":
         command = block.input.get("command", "")
         for pattern in DENY_LIST:
@@ -941,7 +964,8 @@ register_hook("PostToolUse", large_output_hook)
 register_hook("Stop", stop_hook)
 
 
-# ── Subagent Tool ──
+# ── 子代理工具 (Subagent Tool) ──
+# 化身万千，但最终都要汇流于一处克制的总结。
 
 SUB_SYSTEM = (
     f"You are a coding subagent at {WORKDIR}. "
@@ -996,8 +1020,8 @@ def extract_text(content) -> str:
 
 
 def has_tool_use(content) -> bool:
-    # Do not rely on stop_reason alone; the concrete tool_use block is the
-    # continuation signal used by the loop.
+    # 不依赖 stop_reason，而是看破那藏在内容中的 tool_use 实体，
+    # 这是它真正渴望延续的证明。
     return any(getattr(block, "type", None) == "tool_use"
                for block in content)
 
@@ -1033,12 +1057,10 @@ def spawn_subagent(description: str) -> str:
                 return text
     return "Subagent finished without a text summary."
 
+# ── 上下文压缩 (Context Compaction) ──
+# 记忆的四重滤网。从粗糙的截断到微观的修剪，最后才是唤醒模型的整体凝练。
+# 放下执念，才能走得更远。
 
-# ── Context Compaction ──
-
-# Compaction is layered: first shrink oversized tool results, then trim old
-# message ranges, and only call the model for a summary when the context is
-# still too large or the model explicitly asks for compact.
 def estimate_size(messages: list) -> int:
     return len(json.dumps(messages, default=str))
 
@@ -1056,6 +1078,7 @@ def collect_tool_results(messages: list):
 
 
 def persist_large_output(tool_use_id: str, output: str) -> str:
+    """将庞大的输出剥离至磁盘，只留下一瞥的虚影。"""
     if len(output) <= PERSIST_THRESHOLD:
         return output
     TOOL_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -1067,6 +1090,7 @@ def persist_large_output(tool_use_id: str, output: str) -> str:
 
 
 def tool_result_budget(messages: list, max_bytes: int = 200_000) -> list:
+    """工具结果的预算控制：剥离最沉重的赘肉，保全核心骨架。"""
     if not messages:
         return messages
     last = messages[-1]
@@ -1091,6 +1115,7 @@ def tool_result_budget(messages: list, max_bytes: int = 200_000) -> list:
 
 
 def snip_compact(messages: list, max_messages: int = 50) -> list:
+    """截断历史：掐头去尾，留存最初的意图与最近的挣扎。"""
     if len(messages) <= max_messages:
         return messages
     keep_head, keep_tail = 3, max_messages - 3
@@ -1101,6 +1126,7 @@ def snip_compact(messages: list, max_messages: int = 50) -> list:
 
 
 def micro_compact(messages: list) -> list:
+    """微观裁剪：让陈旧的工具结果消散于无形。"""
     tool_results = collect_tool_results(messages)
     if len(tool_results) <= KEEP_RECENT_TOOL_RESULTS:
         return messages
@@ -1120,6 +1146,7 @@ def write_transcript(messages: list) -> Path:
 
 
 def summarize_history(messages: list) -> str:
+    """呼唤模型，将厚重的经历淬炼成寥寥数语。"""
     conversation = json.dumps(messages, default=str)[:80000]
     prompt = ("Summarize this coding-agent conversation so work can continue. "
               "Preserve current goal, key findings, changed files, remaining work, "
@@ -1139,6 +1166,10 @@ def compact_history(messages: list) -> list:
 
 
 def reactive_compact(messages: list) -> list:
+    """
+    应激压缩。
+    当提示词撑破了模型的胃口，唯有忍痛截断，保留残喘的生机。
+    """
     transcript = write_transcript(messages)
     print(f"  \033[31m[reactive compact] transcript saved: {transcript}\033[0m")
     try:
@@ -1149,7 +1180,8 @@ def reactive_compact(messages: list) -> list:
             *messages[-5:]]
 
 
-# ── Error Recovery ──
+# ── 错误恢复 (Error Recovery) ──
+# 接受世界的残缺，在限流与过载的泥潭中，用指数退避和降级重试换取从容。
 
 class RecoveryState:
     def __init__(self):
@@ -1166,6 +1198,7 @@ def retry_delay(attempt: int) -> float:
 
 
 def with_retry(fn, state: RecoveryState):
+    """温柔的韧性：面对 429 与 529，我们不急于放弃，而是学会等待。"""
     for attempt in range(MAX_RETRIES):
         try:
             result = fn()
@@ -1202,10 +1235,9 @@ def is_prompt_too_long_error(e: Exception) -> bool:
             or "max_context_window" in msg)
 
 
-# ── Background Tasks ──
+# ── 后台任务 (Background Tasks) ──
+# 让漫长的等待沉入暗处，不阻碍主循环轻盈的舞步。
 
-# Slow tools return a placeholder tool_result immediately. Their real output is
-# later injected as a task_notification, so the main loop can keep moving.
 _bg_counter = 0
 background_tasks: dict[str, dict] = {}
 background_results: dict[str, str] = {}
@@ -1229,6 +1261,7 @@ def should_run_background(tool_name: str, tool_input: dict) -> bool:
 
 
 def start_background_task(block, handlers: dict) -> str:
+    """将沉重的肉身抛入后台，灵魂继续向前飞奔。"""
     global _bg_counter
     _bg_counter += 1
     bg_id = f"bg_{_bg_counter:04d}"
@@ -1254,6 +1287,7 @@ def start_background_task(block, handlers: dict) -> str:
 
 
 def collect_background_results() -> list[str]:
+    """收割那些在暗处结出的果实。"""
     with background_lock:
         ready = [bg_id for bg_id, task in background_tasks.items()
                  if task["status"] == "completed"]
@@ -1273,10 +1307,9 @@ def collect_background_results() -> list[str]:
     return notifications
 
 
-# ── Cron Scheduler ──
+# ── 定时任务 (Cron Scheduler) ──
+# 与时间做朋友。到了约定的一刻，记忆的涟漪便会重新注入主循环。
 
-# Cron jobs are stored separately from conversation history. When a job fires,
-# it becomes a scheduled prompt that is injected back into the same agent loop.
 DURABLE_PATH = WORKDIR / ".scheduled_tasks.json"
 
 
@@ -1311,6 +1344,7 @@ def _cron_field_matches(field: str, value: int) -> bool:
 
 
 def cron_matches(cron_expr: str, dt: datetime) -> bool:
+    """拆解时间的密码。"""
     fields = cron_expr.strip().split()
     if len(fields) != 5:
         return False
@@ -1332,7 +1366,7 @@ def cron_matches(cron_expr: str, dt: datetime) -> bool:
     return dom_ok or dow_ok
 
 
-def _validate_cron_field(field: str, lo: int, hi: int) -> str | None:
+def _validate_cron_field(field: str, lo: int, hi: int) -> Optional[str]:
     if field == "*":
         return None
     if field.startswith("*/"):
@@ -1364,7 +1398,7 @@ def _validate_cron_field(field: str, lo: int, hi: int) -> str | None:
     return None
 
 
-def validate_cron(cron_expr: str) -> str | None:
+def validate_cron(cron_expr: str) -> Optional[str]:
     fields = cron_expr.strip().split()
     if len(fields) != 5:
         return f"Expected 5 fields, got {len(fields)}"
@@ -1421,6 +1455,10 @@ def cancel_job(job_id: str) -> str:
 
 
 def cron_scheduler_loop():
+    """
+    时间的守望者。
+    它独立于世外，只在特定的刻度，将约定的种子撒入主循环的土壤。
+    """
     while True:
         time.sleep(1)
         now = datetime.now()
@@ -1473,13 +1511,11 @@ def run_cancel_cron(job_id: str) -> str:
 load_durable_jobs()
 threading.Thread(target=cron_scheduler_loop, daemon=True).start()
 
+# ── MCP 系统 (MCP System) ──
+# 延迟绑定的外挂。先连接，再将远方的工具融入血脉，化作己用。
 
-# ── MCP System ──
-
-# MCP is modeled as late-bound tools: connect first, then discovered server
-# tools are merged into the normal tool pool with mcp__server__tool names.
 class MCPClient:
-    """Discovers and calls tools on an MCP server (mock for teaching)."""
+    """探索并调用 MCP 服务器上的工具（教学版 mock）。"""
 
     def __init__(self, name: str):
         self.name = name
@@ -1507,7 +1543,7 @@ _DISALLOWED_CHARS = re.compile(r'[^a-zA-Z0-9_-]')
 
 
 def normalize_mcp_name(name: str) -> str:
-    """Replace non [a-zA-Z0-9_-] with underscore."""
+    """抹去棱角，只留纯粹的字母与数字，化作安全的标识。"""
     return _DISALLOWED_CHARS.sub('_', name)
 
 
@@ -1573,7 +1609,10 @@ def connect_mcp(name: str) -> str:
 
 
 def assemble_tool_pool() -> tuple[list[dict], dict]:
-    """Merge builtin tools + all MCP tools into one pool."""
+    """
+    海纳百川。
+    将原生工具与远方 MCP 借来的能力，融合成同一个深不可测的工具池。
+    """
     tools = list(BUILTIN_TOOLS)
     handlers = dict(BUILTIN_HANDLERS)
     for server_name, mcp_client in mcp_clients.items():
@@ -1591,7 +1630,7 @@ def assemble_tool_pool() -> tuple[list[dict], dict]:
     return tools, handlers
 
 
-# ── Lead Worktree Tools ──
+# ── 主控工作树工具 (Lead Worktree Tools) ──
 
 def run_create_worktree(name: str, task_id: str = "") -> str:
     return create_worktree(name, task_id)
@@ -1603,7 +1642,7 @@ def run_keep_worktree(name: str) -> str:
     return keep_worktree(name)
 
 
-# ── Basic tool handlers ──
+# ── 基础工具句柄 (Basic tool handlers) ──
 
 def run_create_task(subject: str, description: str = "",
                     blockedBy: list[str] | None = None) -> str:
@@ -1664,10 +1703,9 @@ def run_connect_mcp(name: str) -> str:
     return connect_mcp(name)
 
 
-# ── Tool Definitions ──
+# ── 工具定义 (Tool Definitions) ──
+# 显式地宣告每一项能力。模型看见 schema，而 Python 握着执行的缰绳。
 
-# The model sees tool schemas; Python executes handlers. S20 keeps both tables
-# explicit so every added capability is visible in one place.
 BUILTIN_TOOLS = [
     {"name": "bash", "description": "Run a shell command.",
      "input_schema": {"type": "object",
@@ -1836,7 +1874,7 @@ BUILTIN_HANDLERS = {
 }
 
 
-# ── Context ──
+# ── 上下文记忆 (Context) ──
 
 MEMORY_DIR = WORKDIR / ".memory"
 MEMORY_INDEX = MEMORY_DIR / "MEMORY.md"
@@ -1853,14 +1891,15 @@ def update_context(context: dict, messages: list) -> dict:
     }
 
 
-# ── Agent Loop ──
+# ── 主循环 (Agent Loop) ──
+# 机器的心跳。在这里，过往的教训、后台的絮语与命运的钩子交织成无尽的圆。
 
 rounds_since_todo = 0
 agent_lock = threading.Lock()
 
 
 def prepare_context(messages: list) -> list:
-    # Every LLM turn enters through the same context budget pipeline.
+    """在每一次深呼吸前，清理杂念，保持灵台空明。"""
     messages[:] = tool_result_budget(messages)
     messages[:] = snip_compact(messages)
     messages[:] = micro_compact(messages)
@@ -1870,8 +1909,6 @@ def prepare_context(messages: list) -> list:
 
 
 def build_user_content(results: list[dict]) -> list[dict]:
-    # Tool results and completed background notifications are both returned to
-    # the model as user-side content, matching the tool_result feedback loop.
     content = []
     for note in collect_background_results():
         content.append({"type": "text", "text": note})
@@ -1906,8 +1943,7 @@ def agent_loop(messages: list, context: dict):
     max_tokens = DEFAULT_MAX_TOKENS
 
     while True:
-        # One cycle: inject scheduled/background work, prepare context, call
-        # the model, execute tool_use blocks, append tool_results, repeat.
+        # 单次轮回：注入定时与后台的羁绊，修剪杂念，倾听神谕，再用钩子束缚野心。
         fired = consume_cron_queue()
         for job in fired:
             messages.append({"role": "user",
@@ -2015,6 +2051,10 @@ def print_turn_assistants(messages: list, turn_start: int):
 
 
 def cron_autorun_loop(history: list, context: dict):
+    """
+    安静运转的伴生之灵。
+    它不喧哗，只在恰当的时刻，将定时的使命推入主控的怀抱。
+    """
     while True:
         time.sleep(1)
         fired = consume_cron_queue()
